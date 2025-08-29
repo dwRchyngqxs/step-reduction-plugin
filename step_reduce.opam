@@ -1,0 +1,33 @@
+opam-version: "2.0"
+name: "step_reduce"
+version: "0.1"
+maintainer: "Quentin Corradi <quentin.corradi@epfl.ch>"
+
+synopsis: "A Rocq plugin to perform single reduction steps."
+description: """
+A Rocq plugin to perform single reduction steps in an easy and controlled manner.
+"""
+
+authors: [
+  "Quentin Corradi <quentin.corradi@epfl.ch>"
+  "Quentin Corradi <q.corradi22@imperial.ac.uk>"
+  "Clément Pit-Claudel <clement.pit-claudel@epfl.ch>"
+]
+
+license: ""
+homepage: ""
+bug-reports: ""
+dev-repo: ""
+
+tags: [
+  "category:Miscellaneous/Coq Extensions"
+  "keyword:reduction"
+  "logpath:step_reduce"
+]
+
+build: ["dune" "build" "-p" step_reduce "-j" jobs]
+depends: [
+  "ocaml" {>= "4.07.1" & < "5.0.0"}
+  "dune" {>= "2.5"}
+  "coq" {>= "9.0.0" & < "10.0.0"}
+]

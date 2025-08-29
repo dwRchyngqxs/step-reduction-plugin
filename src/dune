@@ -1,0 +1,8 @@
+(library
+ (name step_reduce)
+ (public_name step_reduce.plugin)
+ (synopsis "A Rocq plugin to perform single reduction steps.")
+ (libraries rocq-runtime.plugins.ltac rocq-runtime.plugins.ltac2)
+)
+
+(coq.pp (modules g_step_reduce))

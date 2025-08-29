@@ -1,0 +1,55 @@
+DECLARE PLUGIN "step_reduce.plugin"
+
+GRAMMAR EXTEND Gram
+
+  step_reduction_eval:
+  [ [ IDENT "cast" -> { Step.Cast AtLeastOneOccurrence }
+    | IDENT "beta"; name = OPT identref -> { Step.Beta AtLeastOneOccurrence } (* NEXT optional binder name *)
+    | IDENT "zeta"; name = OPT identref -> { Step.Zeta AtLeastOneOccurrence } (* NEXT optional binder name *)
+    | IDENT "zeta_match"; pc = smart_global; proj = OPT nat_or_var
+      -> { Step.ZetaMatch ((pc, proj), AtLeastOneOccurrence) }
+    | IDENT "delta"; name = OPT smart_global -> { Step.Delta (name, AtLeastOneOccurrence) }
+    | IDENT "eta"; pc = OPT smart_global -> { Step.Eta AtLeastOneOccurrence } (* TODO either binder name or type/constructor *)
+    | IDENT "evar" -> { Step.Evar AtLeastOneOccurrence } (* TODO optional evar name *)
+    | IDENT "iota_fix"; name = OPT identref -> { Step.IotaFix AtLeastOneOccurrence } (* NEXT optional binder name *)
+    | IDENT "iota_fix'"; name = OPT identref -> { Step.IotaFixPrime AtLeastOneOccurrence } (* NEXT optional binder name *)
+    | IDENT "iota_cofix"; name = OPT identref -> { Step.IotaCofix AtLeastOneOccurrence } (* NEXT optional binder name *)
+    | IDENT "iota_cofix'"; name = OPT identref -> { Step.IotaCofixPrime AtLeastOneOccurrence } (* NEXT optional binder name *)
+    | IDENT "iota_match"; pc = OPT smart_global -> { Step.IotaMatch AtLeastOneOccurrence } (* TODO optional type/constructor name *)
+    | IDENT "root" -> { Step.Root }
+    | IDENT "head" -> { Step.Head }
+    | IDENT "cbv" -> { Step.Cbv } (* TODO: number or "until global/focus" closure *)
+    | IDENT "cbn" -> { Step.Cbn } (* TODO same *)
+    | IDENT "lazy" -> { Step.Lazy } (* TODO same *)
+  ] ];
+
+  red_expr: (* TODO: does this work ? *)
+  [ [ IDENT "step_reduce"; r = step_reduction_eval -> { Step r }
+  ] ];
+
+END
+
+ARGUMENT EXTEND step_reduction_ltac
+| "cast" -> { Step.Cast AtLeastOneOccurrence }
+| "beta"; identref_opt(name) -> { Step.Beta AtLeastOneOccurrence } (* NEXT optional binder name *)
+| "zeta"; identref_opt(name) -> { Step.Zeta AtLeastOneOccurrence } (* NEXT optional binder name *)
+| "zeta_match"; smart_global(pc); nat_or_var_opt(proj) -> { Step.ZetaMatch ((pc, proj), AtLeastOneOccurrence) }
+| "delta"; smart_global_opt(name) -> { Step.Delta (name, AtLeastOneOccurrence) }
+| "eta"; smart_global_opt(pc) -> { Step.Eta AtLeastOneOccurrence } (* TODO either binder name or type/constructor *)
+| "evar" -> { Step.Evar AtLeastOneOccurrence } (* TODO optional evar name *)
+| "iota_fix"; identref_opt(name) -> { Step.IotaFix AtLeastOneOccurrence } (* NEXT optional binder name *)
+| "iota_fix'"; identref_opt(name) -> { Step.IotaFixPrime AtLeastOneOccurrence } (* NEXT optional binder name *)
+| "iota_cofix"; identref_opt(name) -> { Step.IotaCofix AtLeastOneOccurrence } (* NEXT optional binder name *)
+| "iota_cofix'"; identref_opt(name) -> { Step.IotaCofixPrime AtLeastOneOccurrence } (* NEXT optional binder name *)
+| "iota_match"; smart_global_opt(pc) -> { Step.IotaMatch AtLeastOneOccurrence } (* TODO optional type/constructor name *)
+| "root" -> { Step.Root }
+| "head" -> { Step.Head }
+| "cbv" -> { Step.Cbv } (* TODO: number or "until global/focus" closure *)
+| "cbn" -> { Step.Cbn } (* TODO same *)
+| "lazy" -> { Step.Lazy } (* TODO same *)
+END
+
+TACTIC EXTEND step_reduce_ltac
+| [ "step_reduce"; step_reduction_ltac(a) ] -> {
+  }
+END
