@@ -1,1 +1,1 @@
-Declare ML Module "step-reduce.plugin".
+Declare ML Module "rocq-steps.plugin".

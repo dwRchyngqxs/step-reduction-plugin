@@ -1,4 +1,4 @@
 (coq.theory
- (name step_reduce)
- (package rocq-step_reduce)
- (libraries rocq-step_reduce.plugin))
+ (name Steps)
+ (package rocq-steps)
+ (plugins rocq-steps.plugin))

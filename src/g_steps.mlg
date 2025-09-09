@@ -1,0 +1,129 @@
+DECLARE PLUGIN "rocq-steps.plugin"
+
+{
+  open Ltac_plugin
+  open Stdarg
+  open Procq.Prim
+  open G_redexpr
+  open Proofview
+  open Notations
+  let pr_smart_global = Pputils.pr_or_by_notation Libnames.pr_qualid
+  let pr_reduction pr_occ =
+    Step.pr_reduction
+      (fun o -> Ppred.pr_with_occurrences pr_occ Pp.mt Pp.str (o, ()))
+      Pp.mt
+  let bind_occurence occs =
+    Step.map_reduction
+      (fun _ -> if occs = Locus.AllOccurrences then Locus.AtLeastOneOccurrence else occs)
+      (fun x -> x)
+      (fun x -> x)
+      (fun x -> x)
+      (fun x -> x)
+}
+
+ARGUMENT EXTEND nat_or_cond
+  PRINTED BY { fun _ _ _ (_, x) -> Step.pr_end_condition Pp.mt x }
+  INTERPRETED BY { fun _ _ sigma x -> sigma, Step.map_end_condition (fun x -> x) x }
+  GLOBALIZED BY { fun _ -> Step.map_end_condition (fun x -> x) }
+  RAW_PRINTED BY { fun _ _ _ -> Step.pr_end_condition Pp.mt }
+  GLOB_PRINTED BY { fun _ _ _ -> Step.pr_end_condition Pp.mt }
+| [] -> { Step.ECNat 1 }
+| [ "until_global" (*; c = ltac_expr*) ] -> { Step.ECGlobal () }
+| [ "until_focused" (*; c = ltac_expr*) ] -> { Step.ECLocal () }
+| [ natural(v) ] -> { Step.ECNat v }
+END
+
+ARGUMENT EXTEND eta_kind
+  PRINTED BY { fun _ _ _ (_, x) -> Step.pr_eta_kind (Step.pr_tycons env) x }
+  INTERPRETED BY { fun _ env sigma x -> sigma, Step.map_eta_kind (Step.interp_tycons env) x }
+  GLOBALIZED BY { fun _ -> Step.map_eta_kind (Smartlocate.smart_global ~head:true) }
+  RAW_PRINTED BY { fun _ _ _ -> Step.pr_eta_kind (pr_smart_global) }
+  GLOB_PRINTED BY { fun _ _ _ -> Step.pr_eta_kind (Termops.pr_global_env env) }
+| [] -> { Step.EBoth }
+| [ "prim" smart_global_opt(pc) ] -> { Step.EPrim pc }
+| [ "lambda" ident_opt(id) ] -> { Step.ELambda id }
+END
+
+ARGUMENT EXTEND step_reduction_ltac
+  PRINTED BY { fun _ _ _ (_, x) ->
+    pr_reduction Pp.int (Step.pr_tycons env) (Step.pr_zeta env) (Pptactic.pr_evaluable_reference_env env) x
+  }
+  INTERPRETED BY { fun _ env sigma x ->
+    sigma, Step.map_reduction
+      (fun _ -> AtLeastOneOccurrence)
+      (fun x -> x)
+      (Step.interp_tycons env)
+      (Step.interp_zeta env)
+      (fun x -> x)
+      x
+  }
+  GLOBALIZED BY { fun _ ->
+    Step.map_reduction
+      (fun x -> x)
+      (fun x -> x)
+      (Smartlocate.smart_global ~head:true)
+      (fun (x, y) -> Smartlocate.smart_global ~head:true x, y)
+      (fun x -> Tacred.soft_evaluable_of_global_reference (Smartlocate.smart_global ~head:true x))
+  }
+  RAW_PRINTED BY { fun _ _ _ ->
+    pr_reduction
+      (Pputils.pr_or_var Pp.int)
+      (pr_smart_global)
+      Step.pr_zeta_raw
+      (pr_smart_global)
+  }
+  GLOB_PRINTED BY { fun _ _ _ ->
+    pr_reduction
+      (Pputils.pr_or_var Pp.int)
+      (Termops.pr_global_env env)
+      (Step.pr_zeta_glob env)
+      (Pptactic.pr_evaluable_reference_env env)
+  }
+| [ "cast" ] -> { Step.Cast (AtLeastOneOccurrence : Locus.occurrences_expr) }
+| [ "beta" ident_opt(name) ] -> { Step.Beta (name, AtLeastOneOccurrence) }
+| [ "zeta" ident_opt(name) ] -> { Step.Zeta (name, AtLeastOneOccurrence) }
+| [ "zeta_match" smart_global(pc) nat_or_var_opt(proj) ] -> { Step.ZetaMatch ((pc, proj), AtLeastOneOccurrence) }
+| [ "delta" smart_global_opt(name) ] -> { Step.Delta (name, AtLeastOneOccurrence) }
+| [ "eta" eta_kind(k) ] -> { Step.Eta (k, AtLeastOneOccurrence) }
+| [ "evar" ] -> { Step.Evar AtLeastOneOccurrence }
+| [ "iota_fix" ident_opt(name) ] -> { Step.IotaFix (name, AtLeastOneOccurrence) }
+| [ "iota_fix'" ident_opt(name) ] -> { Step.IotaFixPrime (name, AtLeastOneOccurrence) }
+| [ "iota_cofix" ident_opt(name) ] -> { Step.IotaCofix (name, AtLeastOneOccurrence) }
+| [ "iota_cofix'" ident_opt(name) ] -> { Step.IotaCofixPrime (name, AtLeastOneOccurrence) }
+| [ "iota_match" smart_global_opt(pc) ] -> { Step.IotaMatch (pc, AtLeastOneOccurrence) }
+| [ "root" ] -> { Step.Root }
+| [ "head" ] -> { Step.Head }
+| [ "cbv" nat_or_cond(c) ] -> { Step.Cbv c }
+| [ "cbn" nat_or_cond(c) ] -> { Step.Cbn c }
+| [ "lazy" nat_or_cond(c) ] -> { Step.Lazy c }
+END
+
+TACTIC EXTEND step_reduce_ltac
+| [ "steps" step_reduction_ltac(a) clause_dft_concl(cl) ] -> {
+    ( match Redexpr.out_occurrences cl.concl_occs with
+      | NoOccurrences -> tclUNIT ()
+      | occs ->
+        Tactics.reduct_in_concl
+          ~cast:false
+          ~check:false
+          (Step.step (bind_occurence occs (snd a)), Constr.DEFAULTcast)
+    ) <*> Goal.enter (fun gl ->
+      List.fold_left
+        ( fun tcl (occs, hyp) ->
+          tcl <*> Tactics.reduct_in_hyp
+            ~check:false
+            ~reorder:false
+            (Step.step (bind_occurence occs (snd a)))
+            hyp
+        )
+        (tclUNIT ())
+        ( match cl.onhyps with
+          | None ->
+            List.map
+              (fun id -> Locus.AtLeastOneOccurrence, (id, Locus.InHyp))
+              (Tacmach.pf_ids_of_hyps gl)
+          | Some l -> List.map (fun ((occs, id), f) -> Redexpr.out_occurrences occs, (id, f)) l
+        )
+    )
+  }
+END
