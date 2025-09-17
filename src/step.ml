@@ -1,6 +1,5 @@
 open Pp
 open CErrors
-open Result
 open Environ
 open Names
 open Constr
@@ -33,21 +32,33 @@ let or_step f x g =
   | Some x -> Some (f x)
   | None -> g ()
 
-let rec first_step l =
-  match l with
-  | [] -> None
+let rec first_step = function
+| [] -> None
+| h :: t ->
+  match h () with
+  | Some x -> Some x
+  | None -> first_step t
+
+let first_success msg l =
+  let rec aux errs = function
+  | [] -> Error errs
   | h :: t ->
     match h () with
-    | Some x -> Some x
-    | None -> first_step t
+    | Ok x -> Ok x
+    | Error e -> aux (e :: errs) t
+  in
+  Result.map_error
+    (fun l -> msg ++ pr_vertical_list id l)
+    (aux [] l)
 
-let or_else x f =
+let opt_or x f =
   match x with
   | None -> f ()
-  | _ -> x
+  | Some x -> Some x
 
 let for_step f e =
-  let rec aux i = if i = e then None else or_else (f i) (fun _ -> aux (i + 1))
+  let rec aux i =
+    if i = e then None else opt_or (f i) (fun _ -> aux (i + 1))
   in aux
 
 let array_step_n f a =
@@ -63,14 +74,14 @@ let slist_step f =
   | Cons (h, t) -> or_step (fun h -> cons h t) (f h) (fun _ -> Option.map (cons h) (aux t))
   in aux
 
+let to_result msg = function
+| None -> Error msg
+| Some x -> Ok x
+
 let force msg = function
 | Some x -> x
 | None -> user_err (str msg)
-(*
-let force' msg = function
-| Some x -> x
-| None -> anomaly (str msg)
-*)
+
 
 (* ESSENTIALS *)
 
@@ -212,14 +223,15 @@ let substn x =
 let unlift c =
   let rec aux n c =
     match kind c with
-    | Rel i ->
-      ( match () with
-        | () when i < n -> c
-        | () when i > n -> mkRel (i - 1)
-        | () -> raise DestKO
-      )
+    | Rel i -> (
+      match () with
+      | () when i < n -> c
+      | () when i > n -> mkRel (i - 1)
+      | () -> raise DestKO
+    )
     | _ -> map_with_binders succ aux n c
   in try Some (aux 1 c) with DestKO -> None
+
 
 (* COMMON REDUCTION PROCEDURES *)
 
@@ -230,63 +242,70 @@ let delta_prim_red env (op, u) args =
   let nargs = CPrimitives.arity op in
   let len = Array.length args in
   let fred args =
-    match KredNative.red_prim env () op u args with
-    | Some x -> Ok x
-    | None -> Error "primitive cannot be reduced with provided arguments"
+    to_result (str "cannot be reduced with provided arguments.")
+      (KredNative.red_prim env () op u args)
   in
-  ( match () with
-    | () when len < nargs -> Error "primitive applied to too few arguments"
-    | () when len > nargs ->
-      Result.map
-        (fun head -> mkApp (head, Array.sub args nargs (len - nargs)))
-        (fred (Array.sub args 0 nargs))
-    | () -> fred args
-  )
+  match () with
+  | () when len < nargs -> Error (str "applied to too few arguments.")
+  | () when len > nargs ->
+    Result.map
+      (fun head -> mkApp (head, Array.sub args nargs (len - nargs)))
+      (fred (Array.sub args 0 nargs))
+  | () -> fred args
 
 let delta_var_red env id =
   match lookup_named id env with
-  | LocalDef (_, c, _) -> Some c
-  | LocalAssum _  -> None
+  | LocalDef (_, c, _) -> Ok c
+  | LocalAssum _  ->
+    Error (
+      str "variable "
+      ++ Id.print id
+      ++ str " has no unfoldable definition."
+    )
 
 let delta_const_red env sp =
   try Ok (constant_value_in env sp)
   with NotEvaluableConst x -> Error x
 
-let eta_lambda_red evm env t c =
-  try
-    let head, args = destApp c in
-    let nargs = Array.length args in
-    let arg = args.(nargs - 1) in
-    if not (isRelN 1 arg)
-    then Error "Argument of the application under abstraction is not the bound variable."
-    else
-      match unlift (if nargs = 1 then head else mkApp (head, Array.sub args 0 (nargs - 1))) with
-      | None -> Error "Variable bound by the abstraction is used more than once."
+let eta_lambda_red env evm t c =
+  match kind c with
+  | App (h, a) when isRelN 1 (CArray.last a) ->
+    let nargs = Array.length a in
+    ( match
+        unlift (if nargs = 1 then h else mkApp (h, Array.sub a 0 (nargs - 1)))
+      with
+      | None -> Error (str "the variable bound by the abstraction is used more than once.")
       | Some c ->
         let tyc = Retyping.get_type_of env evm (EConstr.of_constr c) in
         let _, k, _ = EConstr.destProd evm tyc in
         if Reductionops.is_conv env evm (EConstr.of_constr t) k
         then Ok c
-        else Error "Performing eta reduction would change type."
-  with DestKO -> Error "Term under abstraction is not an application."
+        else Error (str "performing an eta reduction would change the type of the term.")
+    )
+  | _ -> Error (str "the term under the abstraction must be an application with the bound variable appearing only as the last argument of this application.")
 
-let is_fix_reducible env ((reci, i), _) args =
+let fix_red env ((reci, i), (nas, _, _) as f) args =
   let argi = reci.(i) in
-  argi < Array.length args &&
+  let reducible =
+    argi < Array.length args &&
     match kind args.(argi) with
     | Construct _ -> true
     | App (head, _) -> isConstruct head
-    | Const (kn, _) ->
-      ( match (lookup_constant kn env).const_body with
-        | Symbol true -> true (* Unholy rewrite get out of this kernel *)
-        | _ -> false
-      )
+    | Const (kn, _) -> (
+      match (lookup_constant kn env).const_body with
+      | Symbol true -> true (* Unholy rewrite get out of this kernel *)
+      | _ -> false
+    )
     | _ -> false
-
-let fix_red env f args =
-  if is_fix_reducible env f args
-  then Some (mkApp (contract_fix f, args))
-  else None
+  in
+  if reducible then Ok (mkApp (contract_fix f, args))
+  else
+    Error (
+      pr_nth (argi + 1)
+      ++ str "argument of fixpoint "
+      ++ Name.print nas.(i).binder_name
+      ++ str " is not an applied constructor."
+    )
 
 let proj_red pn args =
   let n = Projection.(npars pn + arg pn) in
@@ -301,8 +320,8 @@ let match_red env ci u c brs args =
   let br = expand_branch mind u pms brs (c - 1) in
   mkApp (br, args)
 
-let match_uip_red_specif env (mib, mip) u pms indices = function
-| [||] -> None
+let match_uip_red_specif env evm (mib, mip) u pms indices = function
+| [||] -> Error (str "cannot eliminate a type without constructors in SProp.")
 | [| [||] , br |] ->
   let open Declarations in
   let expect_indices =
@@ -311,20 +330,30 @@ let match_uip_red_specif env (mib, mip) u pms indices = function
   in
   let nind = Array.length indices in
   let rec loop i =
-    if Int.equal nind i then true else
+    if Int.equal nind i then Ok br else
     let expected = expect_indices.(mib.mind_nparams + i) in
     let expected = Vars.substl pms expected in
     match Conversion.conv env expected indices.(i) with
     | Ok () -> loop (i + 1)
-    | Error () -> false
-  in
-  if loop 0 then Some br else None
-| _ -> anomaly (str "UIP on a type which doesn't have a unique constructor.")
+    | Error () ->
+      Error (
+        pr_nth (mib.mind_nparams + i)
+        ++ str " parameter prevents elimination in SProp; expected "
+        ++ quote (hov 0 (Printer.safe_pr_constr_env env evm expected))
+        ++ str " got "
+        ++ quote (hov 0 (Printer.safe_pr_constr_env env evm indices.(i)))
+        ++ str "."
+      )
+  in loop 0
+| _ -> anomaly (str "Cannot eliminate a type with several constructors in SProp.")
 
-let match_uip_red env ci u pms indices brs =
-  let mind = lookup_mind_specif env ci.ci_ind in
-  let ps = expand_match_param_context mind u pms in
-  match_uip_red_specif env mind u ps indices brs
+let match_uip_red env evm ci u pms iv brs =
+  match iv with
+  | CaseInvert {indices} ->
+    let mind = lookup_mind_specif env ci.ci_ind in
+    let ps = expand_match_param_context mind u pms in
+    match_uip_red_specif env evm mind u ps indices brs
+  | NoInvert -> Error (str "type cannot be eliminated in SProp.")
 
 let bind_to_index =
   let rec aux k m = function
@@ -339,911 +368,414 @@ let bind_to_index =
 *)
 let zeta_match_red br nas brs c brn n =
   let br' = substn c n br in
-  if br == br' then None else Some (array_with brs brn (nas, br'))
+  if br == br' then Error (str "match let binding is already reduced.")
+  else Ok (array_with brs brn (nas, br'))
 
 (* primitive projection eta reduction *)
 let eta_prim_red env ind args =
-  let get_record n c =
-    let pn, _, bdy = destProj c in
-    if not (eq_ind_chk (Projection.inductive pn) ind) || Projection.arg pn != n then raise DestKO;
-    bdy
-  in
   let mib = lookup_mind (fst ind) env in
   Result.bind
     ( match mib.mind_record with
-      | PrimRecord x -> let _, x, _, _ = x.(snd ind) in Ok (Array.length x)
-      | _ -> Error "Not a record constructor."
+      | PrimRecord x -> let _, x, _, _ = x.(snd ind) in Ok x
+      | _ ->
+        Error (
+          str "type "
+          ++ Printer.pr_inductive env ind
+          ++ str " is not a primitive record."
+        )
     )
-    ( fun nproj ->
+    ( fun projs ->
+      let get_record n c =
+        match kind c with
+        | Proj (pn, _, bdy) ->
+          if eq_ind_chk (Projection.inductive pn) ind
+          then
+            if Projection.arg pn = n then Ok bdy
+            else
+              Error (
+                pr_nth (n + mib.mind_nparams + 1)
+                ++ str " argument is the wrong projection; expected "
+                ++ Label.print projs.(n)
+                ++ str " got "
+                ++ Projection.print pn
+                ++ str "."
+              )
+          else
+            Error (
+              pr_nth n
+              ++ str " argument is a projection of the wrong type; expected "
+              ++ Printer.pr_inductive env (Projection.inductive pn)
+              ++ str " got "
+              ++ Printer.pr_inductive env ind
+              ++ str "."
+            )
+        | _ -> Error (pr_nth n ++ str " argument is not a projection.")
+      in
+      let nproj = Array.length projs in
       let nargs = Array.length args in
       if mib.mind_nparams + nproj != nargs
-      then Error "Record constructor applied to too few arguments."
-      else try
-        let base_c = get_record 0 args.(mib.mind_nparams) in
-        let rec arg_loop n =
-          let cn = n - mib.mind_nparams in
-          if cn = 0 then Ok base_c else
-          if Constr.equal (get_record cn args.(n)) base_c
-          then arg_loop (n - 1)
-          else Error "Terms under projections are not the same."
-        in
-        arg_loop (nargs - 1)
-      with DestKO -> Error "Wrong projection."
+      then
+        Error (
+          str "record constructor is not fully applied; expected "
+          ++ int (mib.mind_nparams + nproj)
+          ++ str " arguments, got "
+          ++ int nargs
+          ++ str "."
+        )
+      else
+        Result.bind (get_record 0 args.(mib.mind_nparams)) (fun base_c ->
+          let rec arg_loop n =
+            let cn = n - mib.mind_nparams in
+            if cn = 0 then Ok base_c else
+            Result.bind (get_record cn args.(n)) (fun new_c ->
+              if Constr.equal base_c new_c then arg_loop (n - 1)
+              else
+                Error (
+                  str "term under the projection differ between the "
+                  ++ pr_nth (mib.mind_nparams + 1)
+                  ++ str " and "
+                  ++ pr_nth (cn + 1)
+                  ++ str " argument."
+                )
+            )
+          in arg_loop (nargs - 1)
+        )
     )
+
+let evar_red evm (ev, sl) =
+  to_result
+    (str "evar " ++ Evar.print ev ++ str " has no unfoldable definition.")
+    (Evd.existential_opt_value0 evm (ev, sl))
+
 
 (* HEAD AND REDUCTION STRATEGY HELPERS *)
 
 let app_head env head args =
   match kind head with
-  | Lambda (_, _, c) -> Some (beta_red c args)
+  | Lambda (_, _, c) -> Ok (beta_red c args)
   | Fix f -> fix_red env f args
-  | Const (c, u) ->
-    Option.bind (get_primitive env c)
-      (fun op -> Result.to_option (delta_prim_red env (op, u) args))
-  | Construct ((ind, _), _) -> Result.to_option (eta_prim_red env ind args)
-  | _ -> None
+  | Const (c, u) -> (
+    match get_primitive env c with
+    | Some op -> delta_prim_red env (op, u) args
+    | None -> Error (str "No reduction applicable.")
+  )
+  | Construct ((ind, _), _) -> eta_prim_red env ind args
+  | _ -> Error (str "No reduction applicable.")
 
 let const_head env sp =
-  match delta_const_red env sp with
-  | Ok x -> Some x
-  | Error (HasRules _) -> Feedback.msg_warning (str "Cannot reduce symbols."); None (* Rules should be removed from Rocq *)
-  | Error _ -> None
-
-let iota_match_head env ci u pms bi iv c brs =
-  match kind c with
-  | Construct ((_, c), _) -> Some (match_red env ci u c brs [||])
-  | CoFix cf -> Some (mkCase (ci, u, pms, bi, iv, contract_cofix cf, brs))
-  | App (head, args) ->
-    ( match kind head with
-      | Construct ((_, c), _) -> Some (match_red env ci u c brs args)
-      | CoFix cf -> Some (mkCase (ci, u, pms, bi, iv, mkApp (contract_cofix cf, args), brs))
-      | _ -> None
+  let the_const () = str "constant " ++ Constant.print (fst sp) in
+  Result.map_error
+    ( function
+      | NoBody -> the_const () ++ str " has no definition."
+      | Opaque -> the_const () ++ str " is opaque."
+      | IsPrimitive _ -> the_const () ++ str " is an unapplied primitive."
+      | HasRules _ -> (* Rules should be removed from Rocq *)
+        Feedback.msg_warning (str "Cannot reduce symbols.");
+        the_const () ++ str " is a symbol with custom rewrite rules."
     )
-  | _ -> None
+    (delta_const_red env sp)
 
-let zeta_match_step brn n (env, ci, u, pms, bi, iv, c, brs) =
+let iota_match_head env (ci, u, pms, bi, iv, c, brs) =
+  match kind c with
+  | Construct ((_, c), _) -> Ok (match_red env ci u c brs [||])
+  | CoFix cf -> Ok (mkCase (ci, u, pms, bi, iv, contract_cofix cf, brs))
+  | App (head, args) -> (
+    match kind head with
+    | Construct ((_, c), _) -> Ok (match_red env ci u c brs args)
+    | CoFix cf -> Ok (mkCase (ci, u, pms, bi, iv, mkApp (contract_cofix cf, args), brs))
+    | _ -> Error (str "Failed iota reduction: scrutinee is not an applied constructor or cofix.")
+  )
+  | _ -> Error (str "Failed iota reduction: scrutinee is not an applied constructor or cofix.")
+
+let zeta_match_step brn n env (ci, u, pms, bi, iv, c, brs) =
   let nas, br = brs.(brn) in
   let mind = lookup_mind_specif env ci.ci_ind in
   let ps = expand_match_param_context mind u pms in
   let binds = expand_branch_context mind u ps brs brn in
-  let bind = match List.nth binds n with LocalDef (_, c, _) -> c | _ -> assert false in
-  let brs =
-    force "Match let binding is already reduced."
-      (zeta_match_red br nas brs bind brn (n + 1)) in
-  mkCase (ci, u, pms, bi, iv, c, brs)
+  let bind =
+    match List.nth binds n with
+    | LocalDef (_, c, _) -> c
+    | _ -> assert false
+  in
+  Result.map (fun brs -> mkCase (ci, u, pms, bi, iv, c, brs))
+    (zeta_match_red br nas brs bind brn (n + 1))
 
 let zeta_match_head env ci u pms brs =
   let mind = Inductive.lookup_mind_specif env ci.ci_ind in
   let ps = expand_match_param_context mind u pms in
-  for_step
-    ( fun i ->
-      let nargs = ci.ci_cstr_nargs.(i) in
-      let ndecls = ci.ci_cstr_ndecls.(i) in
-      if nargs = ndecls then None else
-      let ctx = expand_branch_context mind u ps brs i in
-      let nas, br = brs.(i) in
-      let rec bind_mapper n = function
-      | [] -> None
-      | LocalAssum _ :: t -> bind_mapper (n + 1) t
-      | LocalDef (_, c, _) :: t ->
-        or_else (zeta_match_red br nas brs c i n) (fun _ -> bind_mapper (n + 1) t)
-      in
-      bind_mapper 1 ctx
+  to_result
+    (str "Failed zeta reduction: all the let bindings are already reduced")
+    ( for_step
+      ( fun i ->
+        let nargs = ci.ci_cstr_nargs.(i) in
+        let ndecls = ci.ci_cstr_ndecls.(i) in
+        if nargs = ndecls then None else
+        let ctx = expand_branch_context mind u ps brs i in
+        let nas, br = brs.(i) in
+        let rec bind_mapper n = function
+        | [] -> None
+        | LocalAssum _ :: t -> bind_mapper (n + 1) t
+        | LocalDef (na, c, _) :: t ->
+          opt_or (Result.to_option (zeta_match_red br nas brs c i n))
+            (fun _ -> bind_mapper (n + 1) t)
+        in
+        bind_mapper 1 ctx
+      )
+      (Array.length brs)
+      0
     )
-    (Array.length brs)
-    0
 
 let proj_head pn r c =
-  if Projection.unfolded pn
-  then
-    ( match kind c with
-      (* Construct impossible because `proj {||}` and `proj {| proj := |}` are not a thing *)
-      | Construct _ -> anomaly (str "Projection on an empty struct.")
-      | CoFix cf -> Some (mkProj (pn, r, contract_cofix cf))
-      | App (head, args) ->
-        ( match kind head with
-          | Construct _ -> Some (proj_red pn args)
-          | CoFix cf -> Some (mkProj (pn, r, mkApp (contract_cofix cf, args)))
-          | _ -> None
-        )
-      | _ -> None
-    )
-  else Some (mkProj (Projection.unfold pn, r, c))
-
-(* ZIPPERS
-
-(* Evar context zipper *)
-module TermSListZipper = struct
-  open SList
-
-  type t =
-  { mutable left: constr SList.t;
-    mutable right: constr SList.t;
-    (* keep old term and slist to preserve sharing *)
-    mutable cache: constr option
-  }
-  type t_const =
-  { cleft: constr SList.t;
-    cright: constr SList.t
-  }
-
-  let make =
-    let rec aux acc = function
-    | Nil -> None
-    | Cons (h, t) -> Some ({left = acc; right = t; cache = Some h}, h)
-    | Default (n, t) -> aux (SList.defaultn n acc) t
-    in aux empty
-
-  let to_const {left; right; _} = {cleft = left; cright = right}
-
-  let update_cache cache old knew =
-    Option.bind cache (fun h -> if h == old then Some knew else None)
-
-  let update s old l r knew =
-    s.left <- l;
-    s.right <- r;
-    s.cache <- update_cache s.cache old knew
-
-  let rec rev_append acc = function
-  | Nil -> acc
-  | Cons (h, t) -> rev_append (cons h acc) t
-  | Default (n, t) -> rev_append (defaultn n acc) t
-
-  let unzip {left; right; cache} t =
-    match cache with
-    | Some h when t == h -> None
-    | _ -> Some (rev_append (SList.cons t right) left)
-
-  let rec unzip_one acc = function
-  | SList.Nil -> Result.Error acc
-  | SList.Cons (h, t) -> Result.Ok (t, h, acc)
-  | SList.Default (n, t) -> unzip_one (SList.defaultn n acc) t
-
-  let move s t =
-    let use_cache sl =
-      Result.Error
-        ( match s.cache with
-          | Some h when t == h -> None
-          | _ -> Some sl
-        )
-    in function
-    | Either.Left () ->
-      ( match unzip_one (cons t s.right) s.left with
-        | Result.Ok (left, h, right) -> update s t left right h; Result.Ok h
-        | Result.Error sl -> use_cache sl
-      )
-    | Either.Right () ->
-      match unzip_one (cons t s.left) s.right with
-      | Result.Ok (right, h, left) -> update s t left right h; Result.Ok h
-      | Result.Error sl -> use_cache sl
-
-  let _ = make, to_const, unzip, move
-end
-
-module TermZipper = struct
-  type 't tern_pos = TLeft of 't | TMiddle | TRight
-  type case_pos = CMatchee | CParams of int | CArity | CBranch of int
-
-  (* zipper keeping old term to preserve sharing *)
-  type context =
-  | CEvar   of Evar.t (* Looking at evar ctx zipper *)
-  | CEvarC  of TermSListZipper.t (* Looking at part of the evar ctx *)
-  | CCast   of constr * cast_kind * types (* Never touch cast type *)
-  | CProd   of (unit, unit) Either.t * Name.t binder_annot * types * types
-  | CLambda of (unit, unit) Either.t * Name.t binder_annot * types * constr
-  | CLetIn  of unit tern_pos * Name.t binder_annot * constr * types * constr
-  | CApp    of (unit, int) Either.t * constr * constr array
-  | CCase   of case_pos * case
-  | CFix    of (int, int) Either.t * fixpoint
-  | CCoFix  of (int, int) Either.t * cofixpoint
-  | CProj   of Projection.t * Sorts.relevance * constr
-  | CArray  of int tern_pos * UVars.Instance.t * constr array * constr * types
-
-  (* Aggressive cache: All superterms are trashed as soon as they are invalidated. *)
-  type t =
-  { mutable ctx: context list;
-    mutable cache: constr list
-  }
-  type t_const =
-  { cctx: context list
-  }
-
-  let make = {ctx = []; cache = []}
-
-(* TODO LATER: seems very complicated
-  let make_evar evm ctx (ev, sl) = Evd.existential_opt_value0 evm (ev, sl)
-*)
-
-  let to_const {ctx; _} = {cctx = ctx}
-
-  let pop_cache tz =
-    match tz.cache with
-    | [] -> None
-    | h :: t -> tz.cache <- t; Some h
-
-  let unzip_evar ev z t =
-    Option.map (fun sl -> mkEvar (ev, sl)) (TermSListZipper.unzip z t)
-
-(* Unused, may be useful
-  let unzip_cast c k t x = if x == c then None else Some (mkCast (x, k, t))
-
-  let unzip_prod na k t x = function
-  | Either.Left () -> if x == k then None else Some (mkProd (na, x, t))
-  | Either.Right () -> if x == t then None else Some (mkProd (na, k, x))
-
-  let unzip_lambda na t c x = function
-  | Either.Left () -> if x == t then None else Some (mkLambda (na, x, c))
-  | Either.Right () -> if x == c then None else Some (mkLambda (na, t, x))
-
-  let unzip_letin na b t c x = function
-  | TLeft () -> if x == t then None else Some (mkLetIn (na, b, x, c))
-  | TMiddle -> if x == b then None else Some (mkLetIn (na, x, t, c))
-  | TRight -> if x == c then None else Some (mkLetIn (na, b, t, x))
-
-  let unzip_app head args x = function
-  | Either.Left () -> if x == head then None else Some (mkApp (x, args))
-  | Either.Right n ->
-    if x == args.(n) then None else Some (mkApp (head, array_with args n x))
-
-  let unzip_case (ci, u, pms, p, iv, c, brs) x = function
-  | CMatchee ->
-    if x == c then None else Some (mkCase (ci, u, pms, p, iv, x, brs))
-  | CParams n ->
-    if x == pms.(n) then None
-    else Some (mkCase (ci, u, array_with pms n x, p, iv, c, brs))
-  | CArity ->
-    let p, r = p in
-    if x == snd p then None
-    else Some (mkCase (ci, u, pms, ((fst p, x), r), iv, c, brs))
-  | CBranch n ->
-    let na, b = brs.(n) in
-    if x == b then None
-    else Some (mkCase (ci, u, pms, p, iv, c, array_with brs n (na, x)))
-
-  let unzip_fix (si, (nas, tys, bds)) x = function
-  | Either.Left n ->
-    if x == tys.(n) then None
-    else Some (mkFix (si, (nas, array_with tys n x, bds)))
-  | Either.Right n ->
-    if x == bds.(n) then None
-    else Some (mkFix (si, (nas, tys, array_with bds n x)))
-
-  let unzip_cofix (ri, (nas, tys, bds)) x = function
-  | Either.Left n ->
-    if x == tys.(n) then None
-    else Some (mkCoFix (ri, (nas, array_with tys n x, bds)))
-  | Either.Right n ->
-    if x == bds.(n) then None
-    else Some (mkCoFix (ri, (nas, tys, array_with bds n x)))
-
-  let unzip_proj pn r c x = if x == c then None else Some (mkProj (pn, r, x))
-
-  let unzip_array u ts def ty x = function
-  | TLeft n ->
-    if x == ts.(n) then None else Some (mkArray (u, array_with ts n x, def, ty))
-  | TMiddle -> if x == def then None else Some (mkArray (u, ts, x, ty))
-  | TRight -> if x == ty then None else Some (mkArray (u, ts, def, x))
-
-  let unzip_one_cache x = function
-  | CEvar _ | CEvarC _ -> anomaly (str "Evar context must be unzipped separately.")
-  | CCast (c, k, t) -> unzip_cast c k t x
-  | CProd (p, na, k, t) -> unzip_prod na k t x p
-  | CLambda (p, na, t, c) -> unzip_lambda na t c x p
-  | CLetIn (p, na, b, t, c) -> unzip_letin na b t c x p
-  | CApp (p, head, args) -> unzip_app head args x p
-  | CCase (p, case) -> unzip_case case x p
-  | CFix (p, fix) -> unzip_fix fix x p
-  | CCoFix (p, cofix) -> unzip_cofix cofix x p
-  | CProj (pn, r, c) -> unzip_proj pn r c x
-  | CArray (p, u, ts, def, ty) -> unzip_array u ts def ty x p
-*)
-
-  let unzip_one_no_cache x = function
-  | CEvar _ | CEvarC _ -> anomaly (str "Ill formed evar context.")
-  | CCast (c, k, t) -> mkCast (x, k, t)
-  | CProd (p, na, k, t) ->
-    ( match p with
-    | Either.Left () -> mkProd (na, x, t)
-    | Either.Right () -> mkProd (na, k, x)
-    )
-  | CLambda (p, na, t, c) ->
-    ( match p with
-    | Either.Left () -> mkLambda (na, x, c)
-    | Either.Right () -> mkLambda (na, t, x)
-    )
-  | CLetIn (p, na, b, t, c) ->
-    ( match p with
-    | TLeft () -> mkLetIn (na, b, x, c)
-    | TMiddle -> mkLetIn (na, x, t, c)
-    | TRight -> mkLetIn (na, b, t, x)
-    )
-  | CApp (p, head, args) ->
-    ( match p with
-    | Either.Left () -> mkApp (x, args)
-    | Either.Right n -> mkApp (head, array_with args n x)
-    )
-  | CCase (pos, (ci, u, pms, p, iv, c, brs)) ->
-    ( match pos with
-    | CMatchee -> mkCase (ci, u, pms, p, iv, x, brs)
-    | CParams n -> mkCase (ci, u, array_with pms n x, p, iv, c, brs)
-    | CArity -> let p, r = p in mkCase (ci, u, pms, ((fst p, x), r), iv, c, brs)
-    | CBranch n ->
-      let na, b = brs.(n) in
-      mkCase (ci, u, pms, p, iv, c, array_with brs n (na, x))
-    )
-  | CFix (p, (si, (nas, tys, bds))) ->
-    ( match p with
-    | Either.Left n -> mkFix (si, (nas, array_with tys n x, bds))
-    | Either.Right n -> mkFix (si, (nas, tys, array_with bds n x))
-    )
-  | CCoFix (p, (ri, (nas, tys, bds))) ->
-    ( match p with
-    | Either.Left n -> mkCoFix (ri, (nas, array_with tys n x, bds))
-    | Either.Right n -> mkCoFix (ri, (nas, tys, array_with bds n x))
-    )
-  | CProj (pn, r, c) -> mkProj (pn, r, x)
-  | CArray (p, u, ts, def, ty) ->
-    match p with
-    | TLeft n -> mkArray (u, array_with ts n x, def, ty)
-    | TMiddle -> mkArray (u, ts, x, ty)
-    | TRight -> mkArray (u, ts, def, x)
-
-  let unzip {ctx; cache} t =
-    let rec aux_no_cache x = function
-    | [] -> x
-    | CEvarC z :: CEvar ev :: t ->
-      aux_no_cache
-        (mkEvar (ev, TermSListZipper.(rev_append (SList.cons x z.right) z.left)))
-        t
-    | h :: t -> aux_no_cache (unzip_one_no_cache x h) t
-    in
-    let rec aux x = function
-    | CEvarC _ :: CEvar _ :: ctx, c :: cache
-    | _ :: ctx, c :: cache -> aux c (ctx, cache)
-    | ctx, [] -> aux_no_cache x ctx
-    | _ -> anomaly (str "Ill formed context.")
-    in aux t (ctx, cache)
-
-  let move_up_evarc tz cz t =
-    match tz.ctx with
-    | CEvar ev :: ctx ->
-      tz.ctx <- ctx;
-      first_step [
-        (fun _ -> pop_cache tz);
-        (fun _ -> unzip_evar ev cz t);
-        fun _ -> anomaly (str "Inconsistent cache.")
-      ]
-    | [] -> None
-    | _ -> anomaly (str "Ill formed context.")
-
-  let unzip_evarc tz cz t =
-    match tz.ctx with
-    | CEvar ev :: ctx ->
-      unzip tz (
-        force' "Inconsistent cache." (
-          or_else (pop_cache tz) (fun _ -> unzip_evar ev cz t)
-        )
-      )
-    | _ -> anomaly (str "Ill formed context.")
-
-  type unzip_res = Fail | Term of constr | EvarContext of TermSListZipper.t
-  let move_up tz t =
-    match tz.ctx with
-    | [] -> Fail
-    | CEvar _ :: _ -> anomaly (str "Evar context must be unzipped with move_up_evarc.")
-    | CEvarC cz :: ctx -> tz.ctx <- ctx; EvarContext cz
-    | h :: ctx ->
-      tz.ctx <- ctx;
-      Term
-        ( match pop_cache tz with
-          | Some t -> t
-          | None -> unzip_one_no_cache t h
-        )
-
-  let zip_evar tz ev sl = tz.ctx <- CEvar ev :: tz.ctx; TermSListZipper.make sl
-
-  let zip_evarc tz cz t = tz.ctx <- CEvarC cz :: tz.ctx; t
-
-  let zip_cast tz c k t = tz.ctx <- CCast (c, k, t) :: tz.ctx; c
-
-  let zip_prod tz d na b c =
-    tz.ctx <- CProd (d, na, b, c) :: tz.ctx;
-    match d with
-    | Either.Left () -> b
-    | Either.Right () -> c
-
-  let zip_lambda tz d na t c =
-    tz.ctx <- CLambda (d, na, t, c) :: tz.ctx;
-    match d with
-    | Either.Left () -> t
-    | Either.Right () -> c
-
-  let zip_letin tz d na b u c =
-    tz.ctx <- CLetIn (d, na, b, u, c) :: tz.ctx;
-    match d with
-    | TLeft () -> u
-    | TMiddle -> b
-    | TRight -> c
-
-  let zip_app tz d head args =
-    tz.ctx <- CApp (d, head, args) :: tz.ctx;
-    match d with
-    | Either.Left () -> Some head
-    | Either.Right k when 0 <= k && k < Array.length args ->
-      Some (Array.unsafe_get args k)
-    | _ -> None
-
-  let zip_case tz d (_, _, pms, ((_, p), _), _, c, brs as case) =
-    tz.ctx <- CCase (d, case) :: tz.ctx;
-    match d with
-    | CMatchee -> Some c
-    | CParams k when 0 <= k && k < Array.length pms ->
-      Some (Array.unsafe_get pms k)
-    | CArity -> Some p
-    | CBranch k when 0 <= k && k < Array.length brs ->
-      Some (snd (Array.unsafe_get brs k))
-    | _ -> None
-
-  let zip_fix tz d (_, (_, tys, bds) as f) =
-    tz.ctx <- CFix (d, f) :: tz.ctx;
-    match d with
-    | Either.Left k when 0 <= k && k < Array.length tys ->
-      Some (Array.unsafe_get tys k)
-    | Either.Right k when 0 <= k && k < Array.length bds ->
-      Some (Array.unsafe_get bds k)
-    | _ -> None
-
-  let zip_cofix tz d (_, (_, tys, bds) as cf) =
-    tz.ctx <- CCoFix (d, cf) :: tz.ctx;
-    match d with
-    | Either.Left k when 0 <= k && k < Array.length tys ->
-      Some (Array.unsafe_get tys k)
-    | Either.Right k when 0 <= k && k < Array.length bds ->
-      Some (Array.unsafe_get bds k)
-    | _ -> None
-
-  let zip_proj tz pn r c = tz.ctx <- CProj (pn, r, c) :: tz.ctx; c
-
-  let zip_array tz d u ts def ty =
-    tz.ctx <- CArray (d, u, ts, def, ty) :: tz.ctx;
-    match d with
-    | TLeft k when 0 <= k && k < Array.length ts ->
-      Some (Array.unsafe_get ts k)
-    | TMiddle -> Some def
-    | TRight -> Some ty
-    | _ -> None
-
-  let _ =
-    TLeft (),
-    TMiddle,
-    TRight,
-    CMatchee,
-    CParams 0,
-    CArity,
-    CBranch 0,
-    make,
-    (* make_evar, *)
-    to_const,
-    unzip,
-    move_up_evarc,
-    unzip_evarc,
-    move_up,
-    zip_evar,
-    zip_evarc,
-    zip_cast,
-    zip_prod,
-    zip_lambda,
-    zip_letin,
-    zip_app,
-    zip_case,
-    zip_fix,
-    zip_cofix,
-    zip_proj,
-    zip_array
-end
-
-(* TODO HERE: rule reduction, check cclosure?
-  Environ.lookup_rewrite_rules kn env -> rewrite_rule list
-  check how they are applied in Reductionops.apply_rule
-  (CClosure.match_elim is too complicated)
-
-  write mutual recursive functions for PE PH PA?
-*)
-
-module TermReduction = struct
-  open TermZipper
-  type red_case = RIota | RZeta of int * int
-  (* rewrite rule: constant.t + number ? *)
-
-  (* TODO/LATER?
-  let reduce_rel tz n =
-    let rec aux n = function
-    | [] -> None
-    | (_, h) :: t ->
-      match h with
-      | CProd (Right (), _, _, _) -> if n > 0 then aux (n - 1) t else None
-      | CLetIn (TRight, _, c, _, _) -> if n > 0 then aux (n - 1) t else Some c
-      | CFix (Either.Right _, (_, (_, _, bds))) ->
-        let k = n - Array.length bds in
-        if k >= 0 then aux k t else Some bds.(n)
-      | CCoFix (Either.Right _, (_, (_, _, bds))) ->
-        let k = n - Array.length bds in
-        if k >= 0 then aux k t else Some bds.(n)
-      | CLambda (Right (), _, _, _) ->
-        if n > 0 then aux (n - 1) t
-        else ... (* TODO *)
-      | CCase (*case_pos * case*) -> (* TODO *)
-      | _ -> aux n t
-    in
-    aux n tz.ctx
-    (* Option.bind (List.nth_opt tz.rel_ctx n)
-      Context.Rel.Declaration.(function LocalDef (_, c, _) -> Some c | LocalAssum _ -> None)
-    *)
-  *)
-
-  let reduce_helper tz =
-    Option.map
-      ( fun (ctx, t) ->
-        tz.cache <- [];
-        tz.ctx <- ctx;
-        t
-      )
-
-  let reduce_lambda tz t =
-    let (*rec*) aux t = function
-    | CApp (Either.Left (), _, args) :: ctx ->
-      Some (ctx, beta_red t args)
-    | _ -> None (* LATER: traverse letin and other stuff like it *)
-    in reduce_helper tz (aux t tz.ctx)
-
-  let reduce_app tz env head args =
-    let r =
-      match kind head with
-      | Lambda (_, _, c) -> Some (beta_red c args)
-      | Fix f -> fix_red env f args
-      | Const (c, u) -> (* TODO: rule reduction *)
-        Option.bind (get_primitive env c)
-          (fun op -> Result.to_option (delta_prim_red env (op, u) args))
-      | Construct ((_, c), _) ->
-        ( match tz.ctx with
-          | CCase (CMatchee, (ci, u, _, _, _, _, brs)) :: ctx ->
-            tz.ctx <- ctx;
-            Some (match_red env ci u c brs args)
-          | CProj (pn, _, _) :: ctx -> tz.ctx <- ctx; Some (proj_red pn args)
-          | _ -> None
-        )
-      | CoFix cf ->
-        ( match tz.ctx with
-          | (CCase _ | CProj _) :: _ -> Some (contract_cofix cf)
-          | _ -> None
-        )
-      | _ -> None
-    in if Option.has_some r then tz.cache <- []; r
-
-  (*
-  let rule_red env evm kn u tz =
-    let open Declarations in
-    let rec aux = function
-    | [] -> None
-    | { lhs_pat = (pu, elims); nvars; rhs } :: t ->
-      let psubst = Partial_subst.make nvars in
-      match UVars.Instance.pattern_match pu (EInstance.kind evm u) psubst with
-      | None -> aux t
-      | Some psubst ->
-        ...
-        let subst, qsubst, usubst = Partial_subst.to_arrays psubst in
-        let usubst = UVars.Instance.of_array (qsubst, usubst) in
-        ...
-        return new headterm
-      
-    in aux (lookup_rewrite_rules kn env)
-  *)
-
-  let reduce_const tz env (kn, u) =
-    let r =
-      match (lookup_constant kn env).const_body with
-      | Def x -> Some (subst_instance_constr u x)
-      | Primitive p ->
-        ( match tz.ctx with
-          | CApp (Either.Left (), _, args) :: ctx ->
-            ( match delta_prim_red env (p, u) args with
-              | Ok v -> tz.ctx <- ctx; Some v
-              | Error _ -> None
-            )
-          | _ -> None
-        )
-      (* | Symbol b ->
-        match rule_red env evm kn tz with
-        | Some ... -> ...
-        | None ->
-          if b
-          then ...
-          else ...
-      *)
-      | Symbol b when b -> (* TODO: rule reduction (remove 'when b') *)
-        ( match tz.ctx with
-          | CApp (Either.Right k, head, args) :: ctx ->
-            ( match kind head with
-              | Fix ((reci, i), _ as f) when reci.(i) = k ->
-                tz.ctx <- ctx; Some (mkApp (contract_fix f, args))
-              | _ -> None
-            )
-          | _ -> None
-        )
-      | _ -> None
-    in if Option.has_some r then tz.cache <- []; r
-
-  let reduce_contruct tz env c =
-    reduce_helper tz (
-      match tz.ctx with
-      | CCase (CMatchee, (ci, u, _, _, _, _, brs)) :: ctx ->
-        Some (ctx, match_red env ci u c brs [||])
-      | CApp (Either.Left (), _, args) :: CCase (CMatchee, (ci, u, _, _, _, _, brs)) :: ctx ->
-        Some (ctx, match_red env ci u c brs args)
-      | CApp (Either.Left (), _, args) :: CProj (pn, _, _) :: ctx ->
-        Some (ctx, proj_red pn args)
-      | CApp (Either.Right k, head, args) :: ctx ->
-        ( match kind head with
-          | Fix ((reci, i), _ as f) when reci.(i) = k ->
-            Some (ctx, mkApp (contract_fix f, args))
-          | _ -> None
-        )
-      | _ -> None
-    )
-
-  let reduce_case tz env (ci, u, pms, p, iv, c, brs) rd =
-    let r =
-      match rd with
-      | RIota -> iota_match_head env ci u pms p iv c brs
-      | RZeta (brn, lbn) ->
-        let ind, tyi = ci.ci_ind in
-        let oib = (lookup_mind ind env).mind_packets.(tyi) in
-        let bindings = CList.firstn (oib.mind_consnrealdecls.(brn)) (fst oib.mind_nf_lc.(brn)) in
-        Some (zeta_match_step brn (bind_to_index lbn bindings) (env, ci, u, pms, p, iv, c, brs))
-    in if Option.has_some r then tz.cache <- []; r
-
-  let reduce_fix tz env f =
-    match tz.ctx with
-    | CApp (Either.Left (), _, args) :: ctx ->
-      let r = fix_red env f args in
-      if Option.has_some r
-      then begin
-        tz.ctx <- ctx;
-        tz.cache <- []
-      end;
-      r
-    | _ -> None
-
-  let reduce_cofix tz cf =
-    match tz.ctx with
-    | CApp (Either.Left (), _, _) :: CCase (CMatchee, _) :: _
-    | CCase (CMatchee, _) :: _ ->
-      tz.cache <- []; Some (contract_cofix cf)
-    | _ -> None
-
-  let _ =
-    RIota,
-    RZeta (0, 0),
-    reduce_lambda,
-    reduce_app,
-    reduce_const,
-    reduce_contruct,
-    reduce_case,
-    reduce_fix,
-    reduce_cofix
-end
-
-let _ = TermReduction.RIota
-
-module TermVisitor = struct
-  type ('r, 'c) control = Stop of 'r | Act of 'c | Up
-  type ('m, 'r) action_kind = Down of 'm | Reduce of 'r
-  type action =
-  | ARel of red_rel
-  | AVar
-  | AEvar of (unit, unit) action_kind
-  | ACast of (unit, unit) action_kind
-  | AProd of (unit, unit) Either.t
-  | ALambda of ((unit, unit) Either.t, unit) action_kind
-  | ALetIn of (unit tern_pos, unit) action_kind
-  | AApp of ((unit, int) Either.t, unit) action_kind
-  | AConst of unit
-  | AConstruct of unit
-  | ACase of (case_pos, red_case) action_kind
-  | AFix of ((int, int) Either.t, unit) action_kind
-  | ACofix of ((int, int) Either.t, unit) action_kind
-  | AProj of (unit, unit) action_kind
-  | AArray of int tern_pos
-
-  class type ['t] t = object
-    method term: TermZipper.t -> constr -> ('t, action) control
-    method evarc: TermZipper.t -> TermSListZipper.t -> constr -> ('t, unit tern_pos) control
-  end
-
-  (* TODO HERE: finish this maybe *)
-  let visit env evm cb t =
-    let tz = TermZipper.make t in
-    let rec aux_term t =
-      match cb#term tz t of
-      | Stop v -> v, TermZipper.unzip tz t
-      | Up ->
-        ( match TermZipper.move_up tz t with
-          | Either.Left t -> aux_term t
-          | Either.Right cz -> aux_evarc cz t
-        )
-      | Act a ->
-        (* TODO: use reductions from TermReduction
-        match a, kind t with
-        | ARel r, Rel i -> (* TODO *)
-        | AVar, Var id -> aux_term (delta_var_red env id)
-        | AEvar a, Evar (ev, sl) ->
-          ( match a with
-            | Move () ->
-              tz.ctx <- (t, CEvar ev) :: tz.ctx;
-              (* TODO *)
-              aux_evarc (TermSListZipper.make sl)
-            | Reduce () -> aux_term (Evd.existential_opt_value0 evm ev)
-          )
-        | ACast a, Cast (c, k, ct) ->
-          ( match a with
-            | Move () -> tz.ctx <- (t, CCast c k ct) :: tz.ctx; aux_term c
-            | Reduce () -> aux_term c
-          )
-        | AProd d, Prod (na, t, b) -> (* TODO *) 
-        | ALambda a, Lambda (na, t, b) ->
-          ( match a with
-            | Move
-            | Reduce
-          )
-        | ALetIn a, LetIn (na, b, u, c) ->
-          ( match a with
-            | Move
-            | Reduce () -> aux_term (subst1 b c)
-          )
-        | AApp a, App (h, al) ->
-          ( match a with
-            | Move
-            | Reduce
-          )
-        | AConst r, Const sp ->
-        | AConstruct r, Construct c ->
-        | ACase a, Case (ci, u, pms, p, iv, b, bl) ->
-          ( match a with
-            | Move
-            | Reduce
-          )
-        | AFix a, Fix f ->
-          ( match a with
-            | Move
-            | Reduce () -> fix_red env f ...
-          )
-        | ACoFix a, CoFix cf ->
-          ( match a with
-            | Move
-            | Reduce () -> contract_cofix
-          )
-        | AProj a, Proj (p, r, b) ->
-          ( match a with
-            | Move () -> aux_term b
-            | Reduce () -> aux_term (proj_head)
-          )
-        | AArray d, Array (u, t, def, ty) ->
-        | _ -> anomaly (str "Not an anomaly? rather a dev error? depends on the reduction fonction provided")
-        *)
-    and aux_evarc cz t =
-      match cb#evarc tz cz t of
-      | Stop v -> v, TermZipper.unzip_evarc tz cz t
-      | Up -> aux_term (TermZipper.move_up_evarc tz cz t)
-      | Act a ->
-        let move d =
-          match TermSListZipper.move cz t d with
-          | Result.Error _ -> anomaly (str "Forbidden zipper movement.")
-          | Result.Ok t -> aux_evarc cz t
-        in
-        match a with
-        | TLeft () -> move (Either.Left ())
-        | TRight -> move (Either.Right ())
-        | TMiddle -> tz.ctx <- EvarC cz :: tz.ctx; aux_term t
-    in aux_term t
-end
-*)
-
-(* TREE WALKER *)
-
-let map_constr_with_binders_left_to_right env g f acc c =
   match kind c with
-  | (Rel _ | Meta _ | Var _   | Sort _ | Const _ | Ind _
-    | Construct _ | Int _ | Float _ | String _) -> c
-  | Cast (b, k, t) ->
-    let b' = f acc b in
-    if b' == b then c else mkCast (b', k, t)
-  | Prod (na, t, b) ->
-    let t' = f acc t in
-    let b' = f (g (LocalAssum (na,t)) acc) b in
-    if t' == t && b' == b then c else mkProd (na, t', b')
-  | Lambda (na, t, b) ->
-    let t' = f acc t in
-    let b' = f (g (LocalAssum (na,t)) acc) b in
-    if t' == t && b' == b then c else mkLambda (na, t', b')
-  | LetIn (na, bo, t, b) ->
-    let t' = f acc t in (* I swapped the first two, I believe I am correct and the other version is wrong *)
-    let bo' = f acc bo in
-    let b' = f (g (LocalDef (na,bo,t)) acc) b in
-    if bo' == bo && t' == t && b' == b then c else mkLetIn (na, bo', t', b')
-  | App (h, al) ->
-    let h' = f acc h in
-    let al' = CArray.map_left (f acc) al in
-    if h == h' && Array.for_all2 (==) al al' then c else mkApp (h', al')
-  | Proj (p, r, b) ->
-    let b' = f acc b in
-    if b' == b then c else mkProj (p, r, b')
-  | Evar (ev, ctx) ->
-    let ctx' = SList.Smart.map (fun c -> f acc c) ctx in
-    if ctx' == ctx then c else mkEvar (ev, ctx')
-  | Case (ci, u, pms, (p, r), iv, b, bl) ->
-	let mind = lookup_mind_specif env ci.ci_ind in
-    let p0, bl0 = expand_case_contexts mind (ci.ci_ind, u) pms (fst p) bl in
-    let f_ctx (nas, c as r) ctx =
-      let c' = f (List.fold_right g ctx acc) c in
-      if c' == c then r else (nas, c')
-    in
-    let b' = f acc b in
-    let pms' = CArray.map_left (f acc) pms in
-    let p' = f_ctx p p0 in
-    let bl' = CArray.map_left (fun (c, c0) -> f_ctx c c0) (Array.map2 (fun x y -> (x, y)) bl bl0) in
-    if b' == b && pms' == pms && p' == p && bl' == bl then c
-    else mkCase (ci, u, pms', (p', r), iv, b', bl')
-  | Fix (ln, (lna, tl, bl)) ->
-    let ctxt = CArray.map2_i (fun i na t -> LocalAssum (na, lift i t)) lna tl in
-    let acc' = Array.fold_left (fun e assum -> g assum e) acc ctxt in
-    let tl', bl' = map_left2 (f acc) (f acc') tl bl in
-    if Array.for_all2 (==) tl tl' && Array.for_all2 (==) bl bl' then c
-    else mkFix (ln,(lna,tl',bl'))
-  | CoFix(ln, (lna, tl, bl)) ->
-    let ctxt = CArray.map2_i (fun i na t -> LocalAssum (na, lift i t)) lna tl in
-    let acc' = Array.fold_left (fun e assum -> g assum e) acc ctxt in
-    let tl', bl' = map_left2 (f acc) (f acc') tl bl in
-    if Array.for_all2 (==) tl tl' && Array.for_all2 (==) bl bl' then c
-    else mkCoFix (ln, (lna, tl', bl'))
-  | Array(u, t, def, ty) ->
-    let t' = CArray.map_left (f acc) t in
-    let def' = f acc def in
-    let ty' = f acc ty in
-    if def' == def && t' == t && ty' == ty then c
-    else mkArray (u, t', def', ty')
+  (* Construct impossible because `proj {||}` and `proj {| proj := |}` are not a thing *)
+  | Construct _ -> anomaly (str "Projection on an empty struct.")
+  | CoFix cf -> Ok (mkProj (pn, r, contract_cofix cf))
+  | App (head, args) -> (
+    match kind head with
+    | Construct _ -> Ok (proj_red pn args)
+    | CoFix cf -> Ok (mkProj (pn, r, mkApp (contract_cofix cf, args)))
+    | _ -> Error (str "Failed iota reduction: scrutinee is not an applied constructor or cofix.")
+  )
+  | _ -> Error (str "Failed iota reduction: scrutinee is not an applied constructor or cofix.")
 
-(* based on e_contextually, prep does matching and pre-processing, f does the reduction *)
-let reduce_with_context occs prep f env t =
-  let count = ref (
-    Locusops.initialize_occurrence_counter occs,
-    match occs with Locus.AtLeastOneOccurrence -> false | _ -> true
-  ) in
-  let rec traverse nested env t =
-    if Locusops.occurrences_done (fst !count) then (* Shortcut *) t else
-    let cont nested = map_constr_with_binders_left_to_right env push_rel (traverse nested) env t in
-    match prep env t with
-    | None -> cont nested
-    | Some payload ->
-      let ok, count' = Locusops.update_occurrence_counter (fst !count) in
-      count := count', snd !count || ok;
-      if not ok then cont nested else
-      match nested with
-      | Some n ->
-        user_err
-          ( str "The subterm at occurrence "
-            ++ int n
-            ++ str " overlaps with the subterm at occurrence "
-            ++ int (Locusops.current_occurrence (fst !count))
-            ++ str "."
+  let proj_step pn r c =
+  if Projection.unfolded pn then proj_head pn r c
+  else Ok (mkProj (Projection.unfold pn, r, c))
+
+
+(* MUTATOR *)
+
+module TermMutator = struct
+  type 't mutation =
+  { trigger: 't -> bool;
+    rewrite: 't -> (constr, Pp.t) Result.t
+  }
+  type t =
+  { rel: (env * int) mutation option;
+    var: (env * Id.t) mutation option;
+    meta: metavariable mutation option;
+    evar: existential mutation option;
+    sort: Sorts.t mutation option;
+    cast: (constr * cast_kind * types) mutation option;
+    prod: (Name.t binder_annot * types * types) mutation option;
+    lambda: (env * Name.t binder_annot * types * constr) mutation option;
+    letin: (Name.t binder_annot * constr * types * constr) mutation option;
+    app: (env * constr * constr array) mutation option;
+    const: (env * Constant.t * UVars.Instance.t) mutation option;
+    ind: (inductive * UVars.Instance.t) mutation option;
+    construct: (constructor * UVars.Instance.t) mutation option;
+    case: (env * case) mutation option;
+    fix: fixpoint mutation option;
+    cofix: cofixpoint mutation option;
+    proj: (env * Projection.t * Sorts.relevance * constr) mutation option;
+    int: Uint63.t mutation option;
+    float: Float64.t mutation option;
+    string: Pstring.t mutation option;
+    array: (UVars.Instance.t * constr array * constr * types) mutation option
+  }
+
+  let idle_mutator = {
+    rel = None;
+    var = None;
+    meta = None;
+    evar = None;
+    sort = None;
+    cast = None;
+    prod = None;
+    lambda = None;
+    letin = None;
+    app = None;
+    const = None;
+    ind = None;
+    construct = None;
+    case = None;
+    fix = None;
+    cofix = None;
+    proj = None;
+    int = None;
+    float = None;
+    string = None;
+    array = None
+  }
+
+  type occ_count =
+  { mutable atleastone: bool;
+    mutable occs: Locusops.occurrences_count
+  }
+
+  let mutate occs mutator env t =
+    let count = {
+      atleastone = occs != Locus.AtLeastOneOccurrence;
+      occs = Locusops.initialize_occurrence_counter occs
+    } in
+    let update_cnt () =
+      let ok, count' = Locusops.update_occurrence_counter count.occs in
+      count.occs <- count';
+      ok
+    in
+    let add_occ occ ft = function
+    | Ok t -> count.atleastone <- true; t
+    | Error e ->
+      if Locusops.is_all_occurrences occs then ft ()
+      else user_err (str "Error at " ++ pr_nth occ ++ str " occurence: " ++ e)
+    in
+    let f_leaf s d t =
+      match s with
+      | Some {trigger; rewrite} when trigger d && update_cnt () ->
+        add_occ
+          (Locusops.current_occurrence count.occs)
+          (fun _ -> t)
+          (rewrite d)
+      | _ -> t
+    in
+    let prep_node s d =
+      Option.bind s (fun {trigger; rewrite} ->
+        if trigger d && update_cnt ()
+        then Some (rewrite, Locusops.current_occurrence count.occs)
+        else None
+      )
+    in
+    let step_node ft d = function
+    | Some (rw, occ) -> add_occ occ ft (rw d)
+    | None -> ft ()
+    in
+    let array_phys_eq = Array.for_all2 (==) in
+    let rec traverse env t =
+      if Locusops.occurrences_done count.occs then (* Shortcut *) t else
+      match kind t with
+      | Rel i -> f_leaf mutator.rel (env, i) t
+      | Var id -> f_leaf mutator.var (env, id) t
+      | Meta m -> f_leaf mutator.meta m t
+      | Evar (ev, sl) ->
+        let rw = prep_node mutator.evar (ev, sl) in
+        let sl' = SList.Smart.map (traverse env) sl in
+        step_node
+          (fun _ -> if sl == sl' then t else mkEvar (ev, sl'))
+          (ev, sl')
+          rw
+      | Sort s -> f_leaf mutator.sort s t
+      | Cast (c, k, ty) ->
+        let rw = prep_node mutator.cast (c, k, ty) in
+        let c' = traverse env c in
+        step_node
+          (fun _ -> if c == c' then t else mkCast (c', k, ty))
+          (c', k, ty)
+          rw
+      | Prod (na, b, c) ->
+        let rw = prep_node mutator.prod (na, b, c) in
+        let b' = traverse env b in
+        let c' = traverse (push_rel (LocalAssum (na, b')) env) c in
+        step_node
+          (fun _ -> if b == b' && c == c' then t else mkProd (na, b', c'))
+          (na, b', c')
+          rw
+      | Lambda (na, ty, c) ->
+        let rw = prep_node mutator.lambda (env, na, ty, c) in
+        let ty' = traverse env ty in
+        let c' = traverse (push_rel (LocalAssum (na, ty')) env) c in
+        step_node
+          (fun _ -> if ty == ty' && c == c' then t else mkLambda (na, ty', c'))
+          (env, na, ty', c')
+          rw
+      | LetIn (na, b, ty, c) ->
+        let rw = prep_node mutator.letin (na, b, ty, c) in
+        let ty' = traverse env ty in
+        let b' = traverse env b in
+        let c' = traverse (push_rel (LocalDef (na, b', ty')) env) c in
+        step_node
+          ( fun _ ->
+            if ty == ty' && b == b' && c == c' then t
+            else mkLetIn (na, b', ty', c')
           )
-      | None -> (* Skip inner occurrences for stable counting of occurrences *)
-        if Locusops.more_specific_occurrences (fst !count)
-        then ignore (cont (Some (Locusops.current_occurrence (fst !count))));
-        f payload
-  in
-  let t = traverse None env t in
-  Locusops.check_used_occurrences (fst !count);
-  if snd !count then t else user_err (str "No occurence to rewrite.")
+          (na, b', ty', c')
+          rw
+      | App (h, a) ->
+        let rw = prep_node mutator.app (env, h, a) in
+        let h' = traverse env h in
+        let a' = CArray.map_left (traverse env) a in
+        step_node
+          ( fun _ ->
+            if h == h' && array_phys_eq a a' then t else mkApp (h', a')
+          )
+          (env, h', a')
+          rw
+      | Const (kn, u) -> f_leaf mutator.const (env, kn, u) t
+      | Ind ind -> f_leaf mutator.ind ind t
+      | Construct c -> f_leaf mutator.construct c t
+      | Case (ci, u, pms, (p, r), iv, c, bl) ->
+        let rw =
+          prep_node mutator.case (env, (ci, u, pms, (p, r), iv, c, bl))
+        in
+        let c' = traverse env c in
+        let pms' = CArray.map_left (traverse env) pms in
+        let mind = lookup_mind_specif env ci.ci_ind in
+        let p0, bl0 =
+          expand_case_contexts mind (ci.ci_ind, u) pms (fst p) bl
+        in
+        let f_ctx (nas, c) ctx = nas, traverse (push_rel_context ctx env) c in
+        let p' = f_ctx p p0 in
+        let bl' = CArray.map2 f_ctx bl bl0 in
+        step_node
+          (fun _ ->
+            if
+              c == c'
+              && array_phys_eq pms pms'
+              && snd p == snd p'
+              && Array.for_all2 (fun (_, x) (_, y) -> x == y) bl bl'
+            then t
+            else mkCase (ci, u, pms', (p', r), iv, c', bl')
+          )
+          (env, (ci, u, pms', (p', r), iv, c', bl'))
+          rw
+      | Fix (i, (nas, tl, bl)) ->
+        let rw = prep_node mutator.fix (i, (nas, tl, bl)) in
+        let env' = push_rec_types (nas, tl, bl) env in
+        let tl', bl' = map_left2 (traverse env) (traverse env') tl bl in
+        step_node
+          ( fun _ ->
+            if array_phys_eq tl tl' && array_phys_eq bl bl' then t
+            else mkFix (i, (nas, tl', bl'))
+          )
+          (i, (nas, tl', bl'))
+          rw
+      | CoFix (i, (nas, tl, bl)) ->
+        let rw = prep_node mutator.cofix (i, (nas, tl, bl)) in
+        let env' = push_rec_types (nas, tl, bl) env in
+        let tl', bl' = map_left2 (traverse env) (traverse env') tl bl in
+        step_node
+          ( fun _ ->
+            if array_phys_eq tl tl' && array_phys_eq bl bl' then t
+            else mkCoFix (i, (nas, tl', bl'))
+          )
+          (i, (nas, tl', bl'))
+          rw
+      | Proj (pn, r, c) ->
+        let rw = prep_node mutator.proj (env, pn, r, c) in
+        let c' = traverse env c in
+        step_node
+          (fun _ -> if c == c' then t else mkProj (pn, r, c'))
+          (env, pn, r, c')
+          rw
+      | Int i -> f_leaf mutator.int i t
+      | Float f -> f_leaf mutator.float f t
+      | String s -> f_leaf mutator.string s t
+      | Array (u, a, def, ty) ->
+        let rw = prep_node mutator.array (u, a, def, ty) in
+        let a' = CArray.map_left (traverse env) a in
+        let def' = traverse env def in
+        let ty' = traverse env ty in
+        step_node
+          ( fun _ ->
+            if array_phys_eq a a' && def == def' && ty == ty' then t
+            else mkArray (u, a', def', ty')
+          )
+          (u, a', def', ty')
+          rw
+    in
+    let t = traverse env t in
+    Locusops.check_used_occurrences count.occs;
+    if count.atleastone then t else user_err (str "No occurence to rewrite.")
+end
 
 
 (* REDUCTION TACTICS *)
@@ -1253,307 +785,403 @@ type 'e eta_kind =
 | ELambda of Id.t option
 | EPrim of 'e option
 
-let match_binder na = function
+let match_binder b = function
+| Name na -> Id.equal na b
+| Anonymous -> false
+
+let match_opt_binder na = function
 | None -> true
-| Some b ->
-  match Context.(na.binder_name) with
-  | Name na when Id.equal na b -> true
-  | _ -> false
+| Some b -> match_binder b Context.(na.binder_name)
 
-let process_tycons head tyc =
-  match kind head with
-  | Construct ((ind, n as c), _) ->
-    ( match tyc with
-      | None -> Some c
-      | Some (ind', None) when eq_ind_chk ind ind' -> Some c
-      | Some (ind', Some n') when eq_ind_chk ind ind' && n = n' -> Some c
-      | _ -> None
-    )
-  | _ -> None
+let cast_mutator = {
+  TermMutator.idle_mutator with cast = Some {
+    trigger = (fun _ -> true);
+    rewrite = fun (c, _, _) -> Ok c
+  }
+}
 
-let cast_prep _ c =
-  match kind c with
-  | Cast (ct, _, _) -> Some ct
-  | _ -> None
+let beta_mutator b = {
+  TermMutator.idle_mutator with app =
+    let rewrite (_, h, a) = let _, _, h = destLambda h in Ok (beta_red h a) in
+    match b with
+    | Some b ->
+      Some {rewrite; trigger = fun (_, h, _) ->
+        match kind h with
+        | Lambda (na, _, _) -> match_binder b na.binder_name
+        | _ -> false
+      }
+    | None -> Some {rewrite; trigger = fun (_, h, _) -> isLambda h}
+}
 
-let cast_step c = c
+let zeta_mutator b = {
+  TermMutator.idle_mutator with letin =
+    let rewrite (_, b, _, c) = Ok (subst1 b c) in
+    match b with
+    | Some b ->
+      Some {rewrite;
+        trigger = fun (na, _, _, _) -> match_binder b na.binder_name
+      }
+    | None -> Some {rewrite; trigger = fun (na, _, _, _) -> true}
+}
 
-let beta_prep b env c =
-  try
-    let head, args = destApp c in
-    let na, _, c = destLambda head in
-    if match_binder na b then Some (c, args) else None
-  with DestKO -> None
+let zeta_match_mutator ty brn n = {
+  TermMutator.idle_mutator with case = Some {
+    trigger = (fun (_, (ci, _, _, _, _, _, _)) -> eq_ind_chk ty ci.ci_ind);
+    rewrite = fun (env, case) -> zeta_match_step brn n env case
+  }
+}
 
-let beta_step (head, args) = beta_red head args
+let delta_mutator e = let open Evaluable in {
+  TermMutator.idle_mutator with
+  var = (
+    let rewrite (env, id) = delta_var_red env id in
+    match e with
+    | Some (EvalVarRef i) ->
+      Some {rewrite; trigger = fun (_, id) -> Id.equal id i}
+    | None -> Some {rewrite; trigger = fun _ -> true}
+    | _ -> None
+  );
+  const = (
+    let rewrite (env, c, u) =
+      let the_const () = str "constant " ++ Constant.print c in
+      Result.map_error
+        ( function
+          | NoBody -> the_const () ++ str " has no definition."
+          | Opaque -> the_const () ++ str " is opaque."
+          | IsPrimitive _ -> assert false
+          | HasRules _ ->
+            the_const () ++ str " is a symbol with custom rewrite rules."
+        )
+        (delta_const_red env (c, u))
+    in
+    match e with
+    | Some (EvalConstRef cr) ->
+      Some {rewrite; trigger = fun (env, c, _) ->
+        QConstant.equal env cr c && not (is_primitive env c)
+      }
+    | None ->
+      Some {rewrite; trigger = fun (env, c, _) -> not (is_primitive env c)}
+    | _ -> None
+  );
+  proj = (
+    let rewrite (_, pn, r, c) = Ok (mkProj (Projection.unfold pn, r, c)) in
+    match e with
+    | Some (EvalProjectionRef p) ->
+      Some {rewrite; trigger = fun (env, pn, _, _) ->
+        QProjection.Repr.equal env p (Projection.repr pn)
+        && not (Projection.unfolded pn)
+      }
+    | None ->
+      Some {rewrite;
+        trigger = fun (_, pn, _, _) -> not (Projection.unfolded pn)
+      }
+    | _ -> None
+  );
+  app =
+    let rewrite (env, h, a) =
+      let c, u = destConst h in
+      let p = Option.get (get_primitive env c) in
+      Result.map_error
+        (fun e -> str "primitive " ++ Constant.print c ++ spc () ++ e)
+        (delta_prim_red env (p, u) a)
+    in
+    match e with
+    | Some (EvalConstRef cr) ->
+      Some {rewrite; trigger = fun (env, h, _) ->
+        match kind h with
+        | Const (c, _) -> QConstant.equal env cr c && is_primitive env c
+        | _ -> false
+      }
+    | None ->
+      Some {rewrite; trigger = fun (env, h, _) ->
+        match kind h with
+        | Const (c, _) -> is_primitive env c
+        | _ -> false
+      }
+    | _ -> None
+}
 
-let zeta_prep b _ c =
-  match kind c with
-  | LetIn (na, p, _, c) -> if match_binder na b then Some (p, c) else None
-  | _ -> None
+let eta_mutator evm ek = {
+  TermMutator.idle_mutator with
+  lambda = (
+    let rewrite (env, na, t, c) = eta_lambda_red env evm t c in
+    match ek with
+    | ELambda (Some b) ->
+      Some {rewrite; trigger = fun (_, na, _, c) ->
+        match kind c with
+        | App (_, a) ->
+          isRelN 1 (CArray.last a) && match_binder b na.binder_name
+        | _ -> false
+      }
+    | EPrim _ -> None
+    | _ ->
+      Some {rewrite; trigger = fun (_, na, _, c) ->
+        match kind c with
+        | App (_, a) -> isRelN 1 (CArray.last a)
+        | _ -> false
+      }
+  );
+  app =
+    let rewrite (env, h, a) =
+      let (ind, _), _ = destConstruct h in
+      eta_prim_red env ind a
+    in
+    let is_primitive_record env ind =
+      match (lookup_mind (fst ind) env).mind_record with
+      | PrimRecord _ -> true
+      | _ -> false
+    in
+    match ek with
+    | EPrim (Some (ind, None)) ->
+      Some {rewrite; trigger = fun (env, h, _) ->
+        match kind h with
+        | Construct ((ind', _), _) ->
+          eq_ind_chk ind ind' && is_primitive_record env ind'
+        | _ -> false
+      }
+    | EPrim (Some (ind, Some n)) ->
+        Some {rewrite; trigger = fun (env, h, _) ->
+          match kind h with
+          | Construct ((ind', n'), _) ->
+            eq_ind_chk ind ind' && n = n' && is_primitive_record env ind'
+          | _ -> false
+      }
+    | ELambda _ -> None
+    | _ ->
+      Some {rewrite; trigger = fun (env, h, _) ->
+        match kind h with
+        | Construct ((ind, _), _) -> is_primitive_record env ind
+        | _ -> false
+      }
+}
 
-let zeta_step (b, c) = subst1 b c
+let evar_mutator evm = {
+  TermMutator.idle_mutator with evar = Some {
+    trigger = (fun _ -> true);
+    rewrite = evar_red evm
+  }
+}
 
-let zeta_match_prep ty brn n env c =
-  match kind c with
-  | Case (ci, u, pms, bi, iv, c, brs) when eq_ind_chk ty ci.ci_ind ->
-    Some (env, ci, u, pms, bi, iv, c, brs)
-  | _ -> None
-
-type delta_kind =
-| DeltaVar of variable
-| DeltaConst of (constr, const_evaluation_result) result
-| DeltaPrim of (CPrimitives.t * UVars.Instance.t) * constr array
-| DeltaProj of Projection.t * Sorts.relevance * constr
-
-(* reduction in prep to avoid matching a primitive *)
-let delta_const_accept_prim env c =
-  match delta_const_red env c with
-  | Error (IsPrimitive _) -> None
-  | x -> Some (env, DeltaConst x)
-
-(* primitive resolution in prep to avoid counting constants twice *)
-let delta_prim_reject_const env c u args =
-  Option.map (fun op -> env, DeltaPrim ((op, u), args)) (get_primitive env c)
-
-let delta_prep e env c =
-  let open Evaluable in
-  match kind c, e with
-  | Var id, Some (EvalVarRef i) when Id.equal id i -> Some (env, DeltaVar id)
-  | Var id, None -> Some (env, DeltaVar id)
-  | Const (c, u), Some (EvalConstRef cr) when QConstant.equal env cr c ->
-    delta_const_accept_prim env (c, u)
-  | Const (c, u), None -> delta_const_accept_prim env (c, u)
-  | Proj (pn, _, _), _ when Projection.unfolded pn -> None
-  | Proj (pn, r, c), Some (EvalProjectionRef p)
-    when QProjection.Repr.equal env p (Projection.repr pn) ->
-    Some (env, DeltaProj (pn, r, c))
-  | Proj (pn, r, c), None -> Some (env, DeltaProj (pn, r, c))
-  | App (head, args), Some (EvalConstRef cr) ->
-    ( match kind head with
-      | Const (c, u) when QConstant.equal env cr c ->
-        delta_prim_reject_const env c u args
-      | _ -> None
-    )
-  | App (head, args), None ->
-    ( match kind head with
-      | Const (c, u) -> delta_prim_reject_const env c u args
-      | _ -> None
-    )
-  | _ -> None
-
-let delta_step = function
-| env, DeltaVar id -> force "Variable has no unfoldable definition." (delta_var_red env id)
-| _, DeltaConst (Ok c) -> c
-| _, DeltaConst (Error Opaque) -> user_err (str "Constant is opaque.")
-| _, DeltaConst (Error NoBody) -> user_err (str "Constant has no definition.")
-| _, DeltaConst (Error (HasRules _)) ->
-  user_err (str "Constant is a symbol with custom rewrite rules.")
-| _, DeltaConst (Error (IsPrimitive _)) -> assert false (* don't try to unfold unapplied primitive *)
-| env, DeltaPrim (p, args) ->
-  ( match delta_prim_red env p args with
-    | Ok x -> x
-    | Error x -> user_err (str ("Could not reduce primitive: " ^ x ^ "."))
+let fix_prime_mutator b = {
+  TermMutator.idle_mutator with fix = Some (
+    let rewrite f = Ok (contract_fix f) in
+    match b with
+    | Some b ->
+      { rewrite;
+        trigger = fun ((_, i), (nas, _, _)) ->
+          match_binder b nas.(i).binder_name
+      }
+    | None -> {rewrite; trigger = fun _ -> true}
   )
-| env, DeltaProj (pn, r, c) -> mkProj (Projection.unfold pn, r, c)
+}
 
-let eta_prep ek env c =
-  let process_prim args ind =
-    match (lookup_mind (fst ind) env).mind_record with
-    | PrimRecord _ -> Some (env, Either.Right (ind, args))
+let fix_mutator b = {
+  TermMutator.idle_mutator with app = Some (
+    let rewrite (env, h, a) = fix_red env (destFix h) a in
+    match b with
+    | Some b ->
+      { rewrite; trigger = fun (_, h, _) ->
+        match kind h with
+        | Fix ((_, i), (nas, _, _)) -> match_binder b nas.(i).binder_name
+        | _ -> false
+      }
+    | None -> {rewrite; trigger = fun (_, h, _) -> isFix h}
+  )
+}
+
+let cofix_prime_mutator b = {
+  TermMutator.idle_mutator with cofix = Some (
+    let rewrite cf = Ok (contract_cofix cf) in
+    match b with
+    | Some b ->
+      { rewrite;
+        trigger = fun (i, (nas, _, _)) -> match_binder b nas.(i).binder_name
+      }
+    | None -> {rewrite; trigger = fun _ -> true}
+  )
+}
+
+let cofix_mutator b =
+  let extract_cofix c =
+    match kind c with
+    | CoFix cf -> Some (cf, [||])
+    | App (h, a) -> (
+      match kind h with
+      | CoFix cf -> Some (cf, a)
+      | _ -> None
+    )
     | _ -> None
   in
-  match ek, kind c with
-  | EBoth, Lambda (_, t, c) -> Some (env, Either.Left (t, c))
-  | ELambda b, Lambda (na, t, c) when match_binder na b ->
-    Some (env, Either.Left (t, c))
-  | EBoth, App (head, args) ->
-    ( match kind head with
-      | Construct ((ind, _), _) -> process_prim args ind
+  { TermMutator.idle_mutator with
+    case = Some (
+      let rewrite (_, (ci, u, pms, bi, iv, c, bl)) =
+        let cf, a = Option.get (extract_cofix c) in
+        Ok (mkCase (ci, u, pms, bi, iv, mkApp (contract_cofix cf, a), bl))
+      in
+      match b with
+      | Some b ->
+        { rewrite; trigger = fun (_, (_, _, _, _, _, c, _)) ->
+          match extract_cofix c with
+          | Some ((i, (nas, _, _)), _) -> match_binder b nas.(i).binder_name
+          | None -> false
+        }
+      | None ->
+        { rewrite; trigger = fun (_, (_, _, _, _, _, c, _)) ->
+          Option.has_some (extract_cofix c)
+        }
+    );
+    proj = Some (
+      let rewrite (_, pn, r, c) =
+        let cf, a = Option.get (extract_cofix c) in
+        Ok (mkProj (pn, r, mkApp (contract_cofix cf, a)))
+      in
+      match b with
+      | Some b ->
+        { rewrite; trigger = fun (_, pn, _, c) ->
+          match extract_cofix c with
+          | Some ((i, (nas, _, _)), _) ->
+            Projection.unfolded pn && match_binder b nas.(i).binder_name
+          | None -> false
+        }
+      | None ->
+        { rewrite; trigger = fun (_, pn, _, c) ->
+          Projection.unfolded pn && Option.has_some (extract_cofix c)
+        }
+    )
+  }
+
+let match_mutator evm tyc =
+  let extract_construct t =
+    match kind t with
+    | Construct c -> Some (c, [||])
+    | App (h, a) -> (
+      match kind h with
+      | Construct c -> Some (c, a)
       | _ -> None
     )
-  | EPrim tyc, App (head, args) ->
-    Option.bind (process_tycons head tyc) (fun (ind, _) -> process_prim args ind)
-  | _ -> None
-
-let eta_step evm = function
-| env, Either.Left (t, c) ->
-  ( match eta_lambda_red evm env t c with
-    | Ok x -> x
-    | Error m -> user_err (str m)
-  )
-| env, Either.Right (ind, args) ->
-  ( match eta_prim_red env ind args with
-    | Ok x -> x
-    | Error x -> user_err (str x)
-  )
-
-let evar_prep _ c =
-  match kind c with
-  | Evar ev -> Some ev
-  | _ -> None
-
-let evar_step evm ev =
-  force "Evar has no unfoldable definition." (Evd.existential_opt_value0 evm ev)
-
-let fix_prime_prep b _ c =
-  match kind c with
-  | Fix ((_, i), (nas, _, _) as f) -> if match_binder nas.(i) b then Some f else None
-  | _ -> None
-
-let fix_prep b env c =
-  try
-    let head, args = destApp c in
-    let (_, i), (nas, _, _) as f = destFix head in
-     if match_binder nas.(i) b then Some (env, f, args) else None
-  with DestKO -> None
-
-let fix_step (env, f, args) =
-  force "Fixpoint is not reducible." (fix_red env f args)
-
-let cofix_prime_prep b _ c =
-  match kind c with
-  | CoFix (i, (nas, _, _) as cf) -> if match_binder nas.(i) b then Some cf else None
-  | _ -> None
-
-let cofix_prep b _ c =
-  let extract_cofix c =
-    Option.bind
-      ( match kind c with
-        | CoFix cf -> Some (cf, [||])
-        | App (head, args) ->
-          ( match kind head with
-            | CoFix cf -> Some (cf, args)
-            | _ -> None
-          )
-        | _ -> None
-      )
-      ( fun (i, (nas, _, _) as cf, args) ->
-        if match_binder nas.(i) b then Some (cf, args) else None
-      )
+    | _ -> None
   in
-  match kind c with
-  | Proj (pn, r, c) ->
-    Option.map (fun (cf, args) -> Either.Left (pn, r, cf, args)) (extract_cofix c)
-  | Case (ci, u, pms, bi, iv, c, brs) ->
-    Option.map (fun (cf, args) -> Either.Right (ci, u, pms, bi, iv, cf, args, brs))
-      (extract_cofix c)
-  | _ -> None
-
-let cofix_step = function
-| Either.Left (pn, r, cf, args) -> mkProj (pn, r, mkApp (contract_cofix cf, args))
-| Either.Right (ci, u, pms, bi, iv, cf, args, brs) ->
-  mkCase (ci, u, pms, bi, iv, mkApp (contract_cofix cf, args), brs)
-
-type match_kind =
-| MatchProj of Projection.t * constr array
-| MatchCase of env * case_info * UVars.Instance.t * int * case_branch array * constr array
-| MatchUIP of env * case_info * UVars.Instance.t * constr array * constr array * case_branch array
-
-let match_prep tyc env c =
-  match kind c with
-  | Proj (pn, r, c) when Projection.unfolded pn ->
-    ( match kind c with
-      (* Construct impossible because primitive have at least one projection *)
-      | App (head, args) ->
-        if Option.has_some (process_tycons head tyc)
-        then Some (MatchProj (pn, args))
-        else None
-      | _ -> None
+  { TermMutator.idle_mutator with
+    case = Some (
+      let rewrite (env, (ci, u, pms, _, iv, c, brs)) =
+        match extract_construct c with
+        | Some (((_, c), _), a) -> Ok (match_red env ci u c brs a)
+        | None ->
+          Result.map_error
+            (fun e -> str "scrutinee is not an applied constructor and " ++ e)
+            (match_uip_red env evm ci u pms iv brs)
+      in
+      match tyc with
+      | Some (ind, Some n) ->
+        { rewrite; trigger = fun (_, (_, _, _, _, _, c, _)) ->
+          match extract_construct c with
+          | Some (((ind', c), _), _) -> eq_ind_chk ind ind' && n == c
+          | None -> false
+        }
+      | Some (ind, None) ->
+        { rewrite;
+          trigger = fun (_, (ci, _, _, _, _, _, _)) -> eq_ind_chk ind ci.ci_ind
+        }
+      | None -> {rewrite; trigger = fun _ -> true}
+    );
+    proj = Some (
+      let rewrite (env, pn, _, c) =
+        match extract_construct c with
+        | Some (_, a) -> Ok (proj_red pn a)
+        | None -> Error (str "scrutinee is not an applied constructor.")
+      in
+      match tyc with
+      | Some (ind, _) ->
+        { rewrite; trigger = fun (_, pn, _, _) ->
+          Projection.unfolded pn && eq_ind_chk ind (Projection.inductive pn)
+        }
+      | None -> {rewrite; trigger = fun (_, pn, _, _) -> Projection.unfolded pn}
     )
-  | Case (ci, u, pms, bi, iv, c, brs) ->
-    first_step [
-      ( fun _ ->
-        Option.map (fun (_, c) -> MatchCase (env, ci, u, c, brs, [||]))
-          (process_tycons c tyc)
-      );
-      ( fun _ ->
-        match kind c with
-        | App (head, args) ->
-          Option.map (fun (_, c) -> MatchCase (env, ci, u, c, brs, args))
-            (process_tycons head tyc)
-        | _ -> None
-      );
-      ( fun _ ->
-        match iv with
-        | CaseInvert {indices} ->
-          Some (MatchUIP (env, ci, u, pms, indices, brs))
-        | _ -> None
-      )
-    ]
-  | _ -> None
+  }
 
-let match_step = function
-| MatchProj (pn, args) -> proj_red pn args
-| MatchCase (env, ci, u, c, brs, args) -> match_red env ci u c brs args
-| MatchUIP (env, ci, u, pms, indices, brs) ->
-  force "Matched type with UIP has wrong indices." (match_uip_red env ci u pms indices brs)
-
-let root_step evm env c =
+let root_step env evm c =
   match kind c with
-  | Var id -> delta_var_red env id
-  | Evar ev -> Evd.existential_opt_value0 evm ev
-  | Cast (ct, _, _) -> Some ct
-  | LetIn (na, b, u, c) -> Some (subst1 b c)
+  | Var id ->
+    Result.map_error (fun e -> str "Failed delta reduction : " ++ e)
+      (delta_var_red env id)
+  | Evar ev ->
+    Result.map_error (fun e -> str "Failed evar reduction: " ++ e)
+      (evar_red evm ev)
+  | Cast (ct, _, _) -> Ok ct
+  | LetIn (na, b, u, c) -> Ok (subst1 b c)
   | App (head, args) -> app_head env head args
-  | Const sp -> const_head env sp
+  | Const sp ->
+    Result.map_error (fun e -> str "Failed delta reduction: " ++ e)
+      (const_head env sp)
   | Case (ci, u, pms, bi, iv, c, brs) ->
-    first_step [
-      (fun _ -> iota_match_head env ci u pms bi iv c brs);
+    first_success (str "Failed reduction of match,") [
+      (fun _ -> iota_match_head env (ci, u, pms, bi, iv, c, brs));
       ( fun _ ->
-        match iv with
-        | CaseInvert {indices} -> match_uip_red env ci u pms indices brs
-        | _ -> None
+        Result.map_error (fun e -> str "SProp elimination: " ++ e)
+          (match_uip_red env evm ci u pms iv brs)
       );
       fun _ ->
-        Option.map (fun brs -> mkCase (ci, u, pms, bi, iv, c, brs))
+        Result.map (fun brs -> mkCase (ci, u, pms, bi, iv, c, brs))
           (zeta_match_head env ci u pms brs)
     ]
-  | Proj (pn, r, c) -> proj_head pn r c
-  | Lambda (_, t, c) -> Result.to_option (eta_lambda_red evm env t c)
-  | Rel _ | Meta _ | Sort _ | Prod _ | Ind _ | Construct _ | Fix _ | CoFix _
-  | Int _ | Float _ | String _ | Array _ -> None
+  | Proj (pn, r, c) -> proj_step pn r c
+  | Lambda (_, t, c) ->
+    Result.map_error (fun e -> str "Failed eta reduction : " ++ e)
+      (eta_lambda_red env evm t c)
+  | Rel _ | Meta _ | Sort _ | Prod _ | Ind _
+  | Construct _ | Fix _ | CoFix _ | Int _
+  | Float _ | String _ | Array _ -> Error (str "No reduction applicable.")
 
-let head_step evm env c =
+let head_step evm _ec (* TODO *) env c =
   let rec aux c =
     match kind c with
-    | Var id -> delta_var_red env id
+    | Var id -> Result.to_option (delta_var_red env id)
     | Evar ev -> Evd.existential_opt_value0 evm ev
-    | Cast (c, k, t) -> Option.map (fun c -> mkCast (c, k, t)) (aux c)
+    | Cast (c, k, t) ->
+      Some (
+        match aux c with
+        | Some c -> mkCast (c, k, t)
+        | None -> c
+      )
     | LetIn (na, b, u, c) -> Some (subst1 b c)
     | App (head, args) ->
-      first_step [
-        (fun _ -> app_head env head args);
-        ( fun _ ->
-          match kind head with
+      opt_or
+        ( match kind head with
           | Fix ((reci, i), f) ->
             let i = reci.(i) in
-            Option.map (fun c -> mkApp (head, array_with args i c)) (aux args.(i))
-          | _ -> None
-        );
-        fun _ -> Option.map (fun h -> mkApp (h, args)) (aux head)
-      ]
-    | Const sp -> const_head env sp
+            if i < Array.length args
+            then
+              Option.map (fun c -> mkApp (head, array_with args i c))
+                (aux args.(i))
+            else None
+          | _ -> Option.map (fun h -> mkApp (h, args)) (aux head)
+        )
+        (fun _ -> Result.to_option (app_head env head args))
+    | Const sp -> Result.to_option (const_head env sp)
     | Case (ci, u, pms, bi, iv, c, brs) ->
       first_step [
-        (fun _ -> iota_match_head env ci u pms bi iv c brs);
+        (fun _ -> Result.to_option (match_uip_red env evm ci u pms iv brs));
         ( fun _ ->
-          match iv with
-          | CaseInvert {indices} -> match_uip_red env ci u pms indices brs
-          | _ -> None
+          Option.map (fun c -> mkCase (ci, u, pms, bi, iv, c, brs)) (aux c)
         );
-        fun _ -> Option.map (fun c -> mkCase (ci, u, pms, bi, iv, c, brs)) (aux c)
+        fun _ ->
+          Result.to_option (iota_match_head env (ci, u, pms, bi, iv, c, brs))
       ]
     | Proj (pn, r, c) ->
-      or_else (proj_head pn r c) (fun _ -> Option.map (fun c -> mkProj (pn, r, c)) (aux c))
-    | Rel _ | Meta _ | Sort _ | Prod _ | Lambda _ | Ind _ | Construct _ | Fix _ | CoFix _
+      if Projection.unfolded pn
+      then
+        or_step (fun c -> mkProj (pn, r, c)) (aux c)
+          (fun _ -> Result.to_option (proj_head pn r c))
+      else Some (mkProj (Projection.unfold pn, r, c))
+    | Rel _ | Meta _ | Sort _ | Prod _ | Lambda _
+    | Ind _ | Construct _ | Fix _ | CoFix _
     | Int _ | Float _ | String _ | Array _ -> None
-  in force "Term at head is not reducible." (aux c)
+    in force "Term at head is not reducible." (aux c)
 
-let cbv_reduce evm env =
+let cbv_reduce env evm =
   let rec aux c =
     match kind c with
-    | Var id -> delta_var_red env id
+    | Var id -> Result.to_option (delta_var_red env id)
     | Evar (evi, ev) -> (* Evar solving is not considered progress :( *)
       Evd.existential_opt_value0 evm (evi, ev)
     | Cast (ct, k, ck) ->
@@ -1574,57 +1202,65 @@ let cbv_reduce evm env =
       first_step [
         (fun _ -> Option.map (fun head -> mkApp (head, args)) (aux head));
         (fun _ -> Option.map (fun hd -> mkApp (head, array_with args 0 hd)) (aux args.(0)));
-        (fun _ -> app_head env head args);
+        (fun _ -> Result.to_option (app_head env head args));
         fun _ -> Option.map (fun args -> mkApp (head, args)) (array_step_n aux args 1)
       ]
-    | Const sp -> const_head env sp
+    | Const sp -> Result.to_option (const_head env sp)
     | Case (ci, u, pms, bi, iv, c, brs) ->
       first_step [
         (fun _ -> Option.map (fun c -> mkCase (ci, u, pms, bi, iv, c, brs)) (aux c));
-        (fun _ -> iota_match_head env ci u pms bi iv c brs);
+        (fun _ -> Result.to_option (iota_match_head env (ci, u, pms, bi, iv, c, brs)));
         (fun _ -> Option.map (fun pms -> mkCase (ci, u, pms, bi, iv, c, brs)) (array_step aux pms));
-        fun _ ->
-          match iv with
-          | CaseInvert {indices} -> match_uip_red env ci u pms indices brs
-          | _ -> None
+        fun _ -> Result.to_option (match_uip_red env evm ci u pms iv brs)
       ]
-    | Proj (pn, r, c) -> proj_head pn r c
-    | Rel _ | Meta _ | Sort _ | Lambda _ | Ind _ | Construct _ | Fix _ | CoFix _
+    | Proj (pn, r, c) -> Result.to_option (proj_step pn r c)
+    | Rel _ | Meta _ | Sort _ | Lambda _
+    | Ind _ | Construct _ | Fix _ | CoFix _
     | Int _ | Float _ | String _ | Array _ -> None
   in aux
 
 let cbv_normalize evm =
   let rec aux env c =
-    let reduce_or_normalize f c = or_else (cbv_reduce evm env c) (fun _ -> aux (f env) c) in
+    let reduce_or_normalize f c =
+      opt_or (cbv_reduce env evm c) (fun _ -> aux (f env) c)
+    in
     match kind c with
     | Evar (evi, ev) ->
-      Option.map (fun ev -> mkEvar (evi, ev)) (slist_step (reduce_or_normalize id) ev)
+      Option.map (fun ev -> mkEvar (evi, ev))
+        (slist_step (reduce_or_normalize id) ev)
     | Prod (na, t, u) ->
-      or_step (fun t -> mkProd (na, t, u)) (aux env t)
-        ( fun _ ->
-          Option.map (fun u -> mkProd (na, t, u)) (aux (push_rel (LocalAssum (na, t)) env) u)
-        )
+      or_step (fun t -> mkProd (na, t, u)) (aux env t) (fun _ ->
+        Option.map (fun u -> mkProd (na, t, u))
+          (aux (push_rel (LocalAssum (na, t)) env) u)
+      )
     | Lambda (na, t, c) ->
       first_step [
         ( fun _ ->
           Option.map (fun c -> mkLambda (na, t, c))
           (reduce_or_normalize (push_rel (LocalAssum (na, t))) c)
         );
-        (fun _ -> Option.map (fun t -> mkLambda (na, t, c)) (reduce_or_normalize id t));
-        (fun _ -> Result.to_option (eta_lambda_red evm env t c))
+        ( fun _ ->
+          Option.map (fun t -> mkLambda (na, t, c)) (reduce_or_normalize id t)
+        );
+        fun _ -> Result.to_option (eta_lambda_red env evm t c)
       ]
     | App (head, args) ->
-      or_step (fun head -> mkApp (head, args)) (aux env head)
-        (fun _ -> Option.map (fun args -> mkApp (head, args)) (array_step (aux env) args))
+      or_step (fun head -> mkApp (head, args)) (aux env head) (fun _ ->
+        Option.map (fun args -> mkApp (head, args)) (array_step (aux env) args)
+      )
     | Case (ci, u, pms, bi, iv, c, brs) ->
       first_step [
-        (fun _ -> Option.map (fun c -> mkCase (ci, u, pms, bi, iv, c, brs)) (aux env c));
         ( fun _ ->
-          Option.map (fun pms -> mkCase (ci, u, pms, bi, iv, c, brs)) (array_step (aux env) pms)
+          Option.map (fun c -> mkCase (ci, u, pms, bi, iv, c, brs)) (aux env c)
         );
         ( fun _ ->
-          Option.map (fun brs -> mkCase (ci, u, pms, bi, iv, c, brs))
-          (zeta_match_head env ci u pms brs)
+          Option.map (fun pms -> mkCase (ci, u, pms, bi, iv, c, brs))
+            (array_step (aux env) pms)
+        );
+        ( fun _ ->
+          match zeta_match_head env ci u pms brs with
+          | Ok brs -> Some (mkCase (ci, u, pms, bi, iv, c, brs))
+          | Error _ -> None
         );
         fun _ ->
           let mind = lookup_mind_specif env ci.ci_ind in
@@ -1642,9 +1278,12 @@ let cbv_normalize evm =
             )
             ( fun _ ->
               let (nas, p), rp = bi in
-              Option.map (fun p -> mkCase (ci, u, pms, ((nas, p), rp), iv, c, brs))
+              Option.map
+                (fun p -> mkCase (ci, u, pms, ((nas, p), rp), iv, c, brs))
                 ( reduce_or_normalize
-                  (push_rel_context (expand_arity_context mind (ci.ci_ind, u) ps nas))
+                  ( push_rel_context
+                    (expand_arity_context mind (ci.ci_ind, u) ps nas)
+                  )
                   p
                 )
             )
@@ -1666,24 +1305,32 @@ let cbv_normalize evm =
     | Proj (pn, r, c) -> Option.map (fun c -> mkProj (pn, r, c)) (aux env c)
     | Array (u, ts, def, ty) ->
       first_step [
-        (fun _ -> Option.map (fun def -> mkArray (u, ts, def, ty)) (reduce_or_normalize id def));
         ( fun _ ->
-          Option.map (fun ts -> mkArray (u, ts, def, ty)) (array_step (reduce_or_normalize id) ts)
+          Option.map (fun def -> mkArray (u, ts, def, ty))
+            (reduce_or_normalize id def)
         );
-        fun _ -> Option.map (fun ty -> mkArray (u, ts, def, ty)) (reduce_or_normalize id ty)
+        ( fun _ ->
+          Option.map (fun ts -> mkArray (u, ts, def, ty))
+            (array_step (reduce_or_normalize id) ts)
+        );
+        fun _ ->
+          Option.map (fun ty -> mkArray (u, ts, def, ty))
+            (reduce_or_normalize id ty)
       ]
-    | Var _ | Rel _ | Meta _ | Sort _ | Cast _ | Const _ | Ind _ | Construct _
+    | Var _ | Rel _ | Meta _ | Sort _
+    | Cast _ | Const _ | Ind _ | Construct _
     | Int _ | Float _ | String _ -> None
     | LetIn _ -> assert false
   in aux
 
-let cbv_step evm env c =
-  force "Term is fully reduced." (or_else (cbv_reduce evm env c) (fun _ -> cbv_normalize evm env c))
+let cbv_step evm ec env c =
+  force "Term is fully reduced."
+    (opt_or (cbv_reduce env evm c) (fun _ -> cbv_normalize evm env c))
 
-let global_step evm env c =
+let global_step evm ec env c =
   let rec aux env c =
     match kind c with
-    | Var id -> delta_var_red env id
+    | Var id -> Result.to_option (delta_var_red env id)
     | Evar (evi, ev) ->
       (* Evar solving is not considered progress :( *)
       or_step (fun ev -> mkEvar (evi, ev)) (slist_step (aux env) ev)
@@ -1694,39 +1341,50 @@ let global_step evm env c =
       *)
       Some (match aux env ct with Some ct -> mkCast (ct, k, ck) | None -> ct)
     | Prod (na, t, u) ->
-      or_step (fun t -> mkProd (na, t, u)) (aux env t)
-        ( fun _ ->
-          Option.map (fun u -> mkProd (na, t, u)) (aux (push_rel (LocalAssum (na, t)) env) u)
-        )
+      or_step (fun t -> mkProd (na, t, u)) (aux env t) (fun _ ->
+        Option.map (fun u -> mkProd (na, t, u))
+          (aux (push_rel (LocalAssum (na, t)) env) u)
+      )
     | Lambda (na, t, c) ->
       first_step [
         ( fun _ ->
-          Option.map (fun c -> mkLambda (na, t, c)) (aux (push_rel (LocalAssum (na, t)) env) c)
+          Option.map (fun c -> mkLambda (na, t, c))
+            (aux (push_rel (LocalAssum (na, t)) env) c)
         );
         (fun _ -> Option.map (fun t -> mkLambda (na, t, c)) (aux env t));
-        fun _ -> Result.to_option (eta_lambda_red evm env t c)
+        fun _ -> Result.to_option (eta_lambda_red env evm t c)
       ]
     | LetIn (na, b, u, c) ->
       Some (
-        match aux env b with Some b -> mkLetIn (na, b, u, c)
+        match aux env b with
+        | Some b -> mkLetIn (na, b, u, c)
         | None ->
-          match aux (push_rel (LocalDef (na, b, u)) env) c with Some c -> mkLetIn (na, b, u, c)
+          match aux (push_rel (LocalDef (na, b, u)) env) c with
+          | Some c -> mkLetIn (na, b, u, c)
           | None -> subst1 b c
       )
     | App (head, args) ->
       first_step [
         (fun _ -> Option.map (fun head -> mkApp (head, args)) (aux env head));
-        (fun _ -> Option.map (fun hd -> mkApp (head, array_with args 0 hd)) (aux env args.(0)));
-        (fun _ -> app_head env head args);
-        fun _ -> Option.map (fun args -> mkApp (head, args)) (array_step_n (aux env) args 1)
+        ( fun _ ->
+          Option.map (fun hd -> mkApp (head, array_with args 0 hd))
+            (aux env args.(0))
+        );
+        (fun _ -> Result.to_option (app_head env head args));
+        fun _ ->
+          Option.map (fun args -> mkApp (head, args))
+            (array_step_n (aux env) args 1)
       ]
-    | Const sp -> const_head env sp
+    | Const sp -> Result.to_option (const_head env sp)
     | Case (ci, u, pms, bi, iv, c, brs) ->
       first_step [
-        (fun _ -> Option.map (fun c -> mkCase (ci, u, pms, bi, iv, c, brs)) (aux env c));
-        (fun _ -> iota_match_head env ci u pms bi iv c brs);
         ( fun _ ->
-          Option.map (fun pms -> mkCase (ci, u, pms, bi, iv, c, brs)) (array_step (aux env) pms)
+          Option.map (fun c -> mkCase (ci, u, pms, bi, iv, c, brs)) (aux env c)
+        );
+        (fun _ -> Result.to_option (iota_match_head env (ci, u, pms, bi, iv, c, brs)));
+        ( fun _ ->
+          Option.map (fun pms -> mkCase (ci, u, pms, bi, iv, c, brs))
+            (array_step (aux env) pms)
         );
         fun _ ->
           let mind = lookup_mind_specif env ci.ci_ind in
@@ -1734,12 +1392,15 @@ let global_step evm env c =
           first_step [
             ( fun _ ->
               match iv with
-              | CaseInvert {indices} -> match_uip_red_specif env mind u ps indices brs
+              | CaseInvert {indices} ->
+                Result.to_option
+                  (match_uip_red_specif env evm mind u ps indices brs)
               | _ -> None
             );
             ( fun _ ->
-              Option.map (fun brs -> mkCase (ci, u, pms, bi, iv, c, brs))
-              (zeta_match_head env ci u pms brs)
+              match zeta_match_head env ci u pms brs with
+              | Ok brs -> Some (mkCase (ci, u, pms, bi, iv, c, brs))
+              | Error _ -> None
             );
             ( fun _ ->
               Option.map (fun brs -> mkCase (ci, u, pms, bi, iv, c, brs))
@@ -1756,8 +1417,15 @@ let global_step evm env c =
             );
             fun _ ->
               let (nas, p), rp = bi in
-              Option.map (fun p -> mkCase (ci, u, pms, ((nas, p), rp), iv, c, brs))
-                (aux (push_rel_context (expand_arity_context mind (ci.ci_ind, u) ps nas) env) p)
+              Option.map
+                (fun p -> mkCase (ci, u, pms, ((nas, p), rp), iv, c, brs))
+                ( aux
+                  ( push_rel_context
+                    (expand_arity_context mind (ci.ci_ind, u) ps nas)
+                    env
+                  )
+                  p
+                )
           ]
       ]
     | Fix (si, (nas, tys, bds)) ->
@@ -1775,14 +1443,21 @@ let global_step evm env c =
             (array_step (aux env) tys)
         )
     | Proj (pn, r, c) ->
-      or_step (fun c -> mkProj (pn, r, c)) (aux env c) (fun _ -> proj_head pn r c)
+      or_step (fun c -> mkProj (pn, r, c)) (aux env c)
+        (fun _ -> Result.to_option (proj_step pn r c))
     | Array (u, ts, def, ty) ->
       first_step [
-        (fun _ -> Option.map (fun def -> mkArray (u, ts, def, ty)) (aux env def));
-        (fun _ -> Option.map (fun t -> mkArray (u, ts, def, ty)) (array_step (aux env) ts));
+        ( fun _ ->
+          Option.map (fun def -> mkArray (u, ts, def, ty)) (aux env def)
+        );
+        ( fun _ ->
+          Option.map (fun t -> mkArray (u, ts, def, ty))
+            (array_step (aux env) ts)
+        );
         fun _ -> Option.map (fun ty -> mkArray (u, ts, def, ty)) (aux env ty)
       ]
-    | Rel _ | Meta _ | Sort _ | Ind _ | Construct _ | Int _ | Float _ | String _ -> None
+    | Rel _ | Meta _ | Sort _ | Ind _ | Construct _
+    | Int _ | Float _ | String _ -> None
   in force "Term is fully reduced." (aux env c)
 
 type 'c end_condition =
@@ -1831,7 +1506,7 @@ let map_end_condition f = function
 
 let map_eta_kind f = function
 | EPrim x -> EPrim (Option.map f x)
-| (EBoth | ELambda _ as x) -> x
+| EBoth | ELambda _ as x -> x
 
 let map_reduction focc fend ftyc fz fd = function
 | Cast occ -> Cast (focc occ)
@@ -1883,22 +1558,22 @@ let pr_end_condition pr = function
 | ECGlobal x -> pr_arg str "until_global" ++ pr_arg pr x
 
 let pr_eta_kind pr = function
-| EBoth -> Pp.mt ()
+| EBoth -> mt ()
 | EPrim x -> pr_arg str "prim" ++ pr_opt pr x
-| ELambda s -> pr_arg str "lambda" ++ pr_opt Names.Id.print s
+| ELambda s -> pr_arg str "lambda" ++ pr_opt Id.print s
 
 let pr_reduction pr_occs pr_closure pr_tycons pr_zeta pr_delta = function
 | Cast occ -> str "cast" ++ pr_occs occ
-| Beta (b, occ) -> str "beta" ++ pr_opt Names.Id.print b ++ pr_occs occ
-| Zeta (b, occ) -> str "zeta" ++ pr_opt Names.Id.print b ++ pr_occs occ
+| Beta (b, occ) -> str "beta" ++ pr_opt Id.print b ++ pr_occs occ
+| Zeta (b, occ) -> str "zeta" ++ pr_opt Id.print b ++ pr_occs occ
 | ZetaMatch (z, occ) -> str "zeta_match" ++ pr_arg pr_zeta z ++ pr_occs occ
 | Delta (t, occ) -> str "delta" ++ pr_opt pr_delta t ++ pr_occs occ
 | Eta (tyc, occ) -> str "eta" ++ pr_eta_kind pr_tycons tyc ++ pr_occs occ
 | Evar occ -> str "evar" ++ pr_occs occ
-| IotaFix (b, occ) -> str "iota_fix" ++ pr_opt Names.Id.print b ++ pr_occs occ
-| IotaFixPrime (b, occ) -> str "iota_fix'" ++ pr_opt Names.Id.print b ++ pr_occs occ
-| IotaCofix (b, occ) -> str "iota_cofix" ++ pr_opt Names.Id.print b ++ pr_occs occ
-| IotaCofixPrime (b, occ) -> str "iota_cofix'" ++ pr_opt Names.Id.print b ++ pr_occs occ
+| IotaFix (b, occ) -> str "iota_fix" ++ pr_opt Id.print b ++ pr_occs occ
+| IotaFixPrime (b, occ) -> str "iota_fix'" ++ pr_opt Id.print b ++ pr_occs occ
+| IotaCofix (b, occ) -> str "iota_cofix" ++ pr_opt Id.print b ++ pr_occs occ
+| IotaCofixPrime (b, occ) -> str "iota_cofix'" ++ pr_opt Id.print b ++ pr_occs occ
 | IotaMatch (tyc, occ) -> str "iota_match" ++ pr_opt pr_tycons tyc ++ pr_occs occ
 | Root -> str "root"
 | Head -> str "head"
@@ -1910,13 +1585,13 @@ let interp_tycons env gr =
   let open GlobRef in
   let fail () = user_err (Termops.pr_global_env env gr ++ str " does not describe a type, constructor nor projection.") in
   match gr with
-  | ConstRef c ->
-    ( try
-        let open Structures in
-        let open Structure in
-        (Structure.find_from_projection c).name, Some 1
-      with Not_found -> fail ()
-    )
+  | ConstRef c -> (
+    try
+      let open Structures in
+      let open Structure in
+      (Structure.find_from_projection c).name, Some 1
+    with Not_found -> fail ()
+  )
   | IndRef ind -> ind, None
   | ConstructRef (ind, n) -> ind, Some n
   | _ -> fail ()
@@ -1926,22 +1601,21 @@ let interp_zeta env (gr, x) =
     let open GlobRef in
     match gr, x with
     | ConstRef _, Some _ -> user_err (str "Too many arguments to zeta_match.")
-    | ConstRef c, None ->
-      ( try
-          let open Environ in
-          let open Structures in
-          let open Structure in
-          let s = Structure.find_from_projection c in
-          let rec count_binds n = function
-          | { proj_body = Some c'; proj_true = false; _ } :: _ when QConstant.equal env c c' -> Some n
-          | { proj_true = pt; _ } :: l -> count_binds (if pt then n else n + 1) l
-          | _ -> None
-          in
-          match count_binds 0 s.projections with
-          | None -> user_err (str "Projection has no definition to delta reduce.")
-          | Some n -> Some (s.name, Some 1, Some (Locus.ArgArg n))
-        with Not_found -> None
-      )
+    | ConstRef c, None -> (
+      try
+        let open Structures in
+        let open Structure in
+        let s = Structure.find_from_projection c in
+        let rec count_binds n = function
+        | {proj_body = Some c'; proj_true = false; _} :: _ when QConstant.equal env c c' -> Some n
+        | {proj_true = pt; _} :: l -> count_binds (if pt then n else n + 1) l
+        | _ -> None
+        in
+        match count_binds 0 s.projections with
+        | None -> user_err (str "Projection has no definition to delta reduce.")
+        | Some n -> Some (s.name, Some 1, Some (Locus.ArgArg n))
+      with Not_found -> None
+    )
     | IndRef ind, x -> Some (ind, None, x)
     | ConstructRef (ind, n), x -> Some (ind, Some n, x)
     | _ -> None
@@ -1949,7 +1623,6 @@ let interp_zeta env (gr, x) =
   ( match zmargs with
     | None -> user_err (str "Argument of zeta_match is neither a type, constructor, nor projection.")
     | Some ((ind, tyi), x, y) ->
-      let open Environ in
       let oib = (lookup_mind ind env).mind_packets.(tyi) in
       let nbrs = Array.length oib.mind_nf_lc in
       let n =
@@ -1964,7 +1637,7 @@ let interp_zeta env (gr, x) =
       | [] -> ()
       | LocalAssum _ :: t -> no_binding n t
       | LocalDef (na, _, _) :: t ->
-        if match_binder na n
+        if match_opt_binder na n
         then user_err (str "Non unique let binding for zeta_match.")
         else no_binding n t
       in
@@ -1972,7 +1645,8 @@ let interp_zeta env (gr, x) =
       | [] -> user_err (str "No let binding for zeta_match.")
       | LocalAssum _ :: t -> single_binding n (k + 1) t
       | LocalDef (na, _, _) :: t ->
-        if match_binder na n then (no_binding n t; k) else single_binding n (k + 1) t
+        if match_opt_binder na n then (no_binding n t; k)
+        else single_binding n (k + 1) t
       in
       let m =
         let bindings = CList.firstn (oib.mind_consnrealdecls.(n)) (fst oib.mind_nf_lc.(n)) in
@@ -1987,23 +1661,28 @@ let interp_zeta env (gr, x) =
 let step red env evm c =
   let f =
     match red with
-    | Cast occ -> reduce_with_context occ cast_prep cast_step
-    | Beta (b, occ) -> reduce_with_context occ (beta_prep b) beta_step
-    | Zeta (b, occ) -> reduce_with_context occ (zeta_prep b) zeta_step
+    | Cast occ -> TermMutator.mutate occ cast_mutator
+    | Beta (b, occ) -> TermMutator.mutate occ (beta_mutator b)
+    | Zeta (b, occ) -> TermMutator.mutate occ (zeta_mutator b)
     | ZetaMatch ((ind, n, m), occ) ->
-      reduce_with_context occ (zeta_match_prep ind n m) (zeta_match_step n m)
-    | Delta (t, occ) -> reduce_with_context occ (delta_prep t) delta_step
-    | Eta (tyc, occ) -> reduce_with_context occ (eta_prep tyc) (eta_step evm)
-    | Evar occ -> reduce_with_context occ evar_prep (evar_step evm)
-    | IotaFix (b, occ) -> reduce_with_context occ (fix_prep b) fix_step
-    | IotaFixPrime (b, occ) -> reduce_with_context occ (fix_prime_prep b) contract_fix
-    | IotaCofix (b, occ) -> reduce_with_context occ (cofix_prep b) cofix_step
-    | IotaCofixPrime (b, occ) -> reduce_with_context occ (cofix_prime_prep b) contract_cofix
-    | IotaMatch (tyc, occ) -> reduce_with_context occ (match_prep tyc) match_step
-    | Root -> fun env x -> force "Term is not reducible at root." (root_step evm env x)
-    | Head -> head_step evm
-    | Cbv _ -> cbv_step evm
-    | Cbn _ -> global_step evm (* LATER *)
-    | Lazy _ -> global_step evm (* LATER *)
+      TermMutator.mutate occ (zeta_match_mutator ind n m)
+    | Delta (t, occ) -> TermMutator.mutate occ (delta_mutator t)
+    | Eta (ek, occ) -> TermMutator.mutate occ (eta_mutator evm ek)
+    | Evar occ -> TermMutator.mutate occ (evar_mutator evm)
+    | IotaFix (b, occ) -> TermMutator.mutate occ (fix_mutator b)
+    | IotaFixPrime (b, occ) -> TermMutator.mutate occ (fix_prime_mutator b)
+    | IotaCofix (b, occ) -> TermMutator.mutate occ (cofix_mutator b)
+    | IotaCofixPrime (b, occ) -> TermMutator.mutate occ (cofix_prime_mutator b)
+    | IotaMatch (tyc, occ) -> TermMutator.mutate occ (match_mutator evm tyc)
+    | Root ->
+      ( fun env t ->
+        match root_step env evm t with
+        | Ok t -> t
+        | Error e -> user_err (str "Term is not reducible at root: " ++ e)
+      )
+    | Head -> head_step evm (ECNat 1) (* TODO *)
+    | Cbv ec -> cbv_step evm ec
+    | Cbn ec -> global_step evm ec (* LATER *)
+    | Lazy ec -> global_step evm ec (* LATER *)
   in
   EConstr.of_constr (f env (EConstr.Unsafe.to_constr c))
