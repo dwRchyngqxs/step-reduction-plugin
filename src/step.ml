@@ -980,12 +980,18 @@ let fix_mutator b = {
     let rewrite (env, h, a) = fix_red env (destFix h) a in
     match b with
     | Some b ->
-      { rewrite; trigger = fun (_, h, _) ->
+      { rewrite; trigger = fun (_, h, a) ->
         match kind h with
-        | Fix ((_, i), (nas, _, _)) -> match_binder b nas.(i).binder_name
+        | Fix ((reci, i), (nas, _, _)) ->
+          match_binder b nas.(i).binder_name && reci.(i) < Array.length a
         | _ -> false
       }
-    | None -> {rewrite; trigger = fun (_, h, _) -> isFix h}
+    | None ->
+      { rewrite; trigger = fun (_, h, a) ->
+        match kind h with
+        | Fix ((reci, i), _) -> reci.(i) < Array.length a
+        | _ -> false
+      }
   )
 }
 
@@ -1611,7 +1617,7 @@ let interp_zeta env (gr, x) =
         | {proj_true = pt; _} :: l -> count_binds (if pt then n else n + 1) l
         | _ -> None
         in
-        match count_binds 0 s.projections with
+        match count_binds 1 s.projections with
         | None -> user_err (str "Projection has no definition to delta reduce.")
         | Some n -> Some (s.name, Some 1, Some (Locus.ArgArg n))
       with Not_found -> None
