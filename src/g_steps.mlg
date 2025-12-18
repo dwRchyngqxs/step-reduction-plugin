@@ -19,6 +19,7 @@ DECLARE PLUGIN "rocq-steps.plugin"
       (fun x -> x)
       (fun x -> x)
       (fun x -> x)
+  let red_expr = Pvernac.Vernac_.red_expr
 }
 
 ARGUMENT EXTEND nat_or_cond
@@ -85,14 +86,14 @@ ARGUMENT EXTEND step_reduction_ltac
 | [ "zeta_match" smart_global(pc) nat_or_var_opt(proj) ] -> { Step.ZetaMatch ((pc, proj), AtLeastOneOccurrence) }
 | [ "delta" smart_global_opt(name) ] -> { Step.Delta (name, AtLeastOneOccurrence) }
 | [ "eta" eta_kind(k) ] -> { Step.Eta (k, AtLeastOneOccurrence) }
-| [ "evar" ] -> { Step.Evar AtLeastOneOccurrence }
+| [ "evar" ] -> { Step.Evar }
 | [ "iota_fix" ident_opt(name) ] -> { Step.IotaFix (name, AtLeastOneOccurrence) }
 | [ "iota_fix'" ident_opt(name) ] -> { Step.IotaFixPrime (name, AtLeastOneOccurrence) }
 | [ "iota_cofix" ident_opt(name) ] -> { Step.IotaCofix (name, AtLeastOneOccurrence) }
 | [ "iota_cofix'" ident_opt(name) ] -> { Step.IotaCofixPrime (name, AtLeastOneOccurrence) }
 | [ "iota_match" smart_global_opt(pc) ] -> { Step.IotaMatch (pc, AtLeastOneOccurrence) }
 | [ "root" ] -> { Step.Root }
-| [ "head" ] -> { Step.Head }
+| [ "head" nat_or_cond(c) ] -> { Step.Head c }
 | [ "cbv" nat_or_cond(c) ] -> { Step.Cbv c }
 | [ "cbn" nat_or_cond(c) ] -> { Step.Cbn c }
 | [ "lazy" nat_or_cond(c) ] -> { Step.Lazy c }
@@ -126,4 +127,46 @@ TACTIC EXTEND step_reduce_ltac
         )
     )
   }
+END
+
+GRAMMAR EXTEND Gram
+GLOBAL: red_expr;
+  nat_or_cond: (* TODO: closure *)
+    [ [ -> { Step.ECNat 1 }
+      | v = natural -> { Step.ECNat v }
+      | IDENT "until_global" (*; c = ltac_expr*) -> { Step.ECGlobal () }
+      | IDENT "until_focused" (*; c = ltac_expr*) -> { Step.ECLocal () }
+    ] ]
+  ;
+  eta_kind:
+    [ [ -> { Step.EBoth }
+      | IDENT "prim"; pc = OPT smart_global -> { Step.EPrim pc }
+      | IDENT "lambda"; id = OPT ident -> { Step.ELambda id }
+    ] ]
+  ;
+  reduction: (* TODO HERE: "at" occurence *)
+    [ [ IDENT "cast" -> { Step.Cast (AtLeastOneOccurrence : int Locus.occurrences_gen) }
+      | IDENT "beta"; name = OPT ident -> { Step.Beta (name, AtLeastOneOccurrence) }
+      | IDENT "zeta"; name = OPT ident -> { Step.Zeta (name, AtLeastOneOccurrence) }
+      | IDENT "zeta_match"; pc = smart_global; proj = OPT nat_or_var
+        -> { Step.ZetaMatch ((pc, proj), AtLeastOneOccurrence) }
+      | IDENT "delta"; name = OPT smart_global -> { Step.Delta (name, AtLeastOneOccurrence) }
+      | IDENT "eta"; k = eta_kind -> { Step.Eta (k, AtLeastOneOccurrence) }
+      | IDENT "evar" -> { Step.Evar }
+      | IDENT "iota_fix"; name = OPT ident -> { Step.IotaFix (name, AtLeastOneOccurrence) }
+      | IDENT "iota_fix'"; name = OPT ident -> { Step.IotaFixPrime (name, AtLeastOneOccurrence) }
+      | IDENT "iota_cofix"; name = OPT ident -> { Step.IotaCofix (name, AtLeastOneOccurrence) }
+      | IDENT "iota_cofix'"; name = OPT ident -> { Step.IotaCofixPrime (name, AtLeastOneOccurrence) }
+      | IDENT "iota_match"; pc = OPT smart_global -> { Step.IotaMatch (pc, AtLeastOneOccurrence) }
+      | IDENT "root" -> { Step.Root }
+      | IDENT "head"; c = nat_or_cond -> { Step.Head c }
+      | IDENT "cbv"; c = nat_or_cond -> { Step.Cbv c }
+      | IDENT "cbn"; c = nat_or_cond -> { Step.Cbn c }
+      | IDENT "lazy"; c = nat_or_cond -> { Step.Lazy c }
+    ] ]
+  ;
+  red_expr: TOP
+    [ [ IDENT "steps"; reduction -> { CErrors.user_err (Pp.str "User reduction will be added in Rocq 9.2.") }
+    ] ]
+  ;
 END

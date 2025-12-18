@@ -27,7 +27,7 @@ type ('occ, 'endc, 'tycons, 'zeta, 'delta) reduction =
     - lambda over application on the only occurence of the variable
     - constructor on respective primitive projections
 *)
-| Evar of 'occ occurrences_gen
+| Evar
 (* Evar: evar resolution + context substitution, not sure about this one *)
 | IotaFix of Id.t option * 'occ occurrences_gen
 (* Iota-fix: push fixpoint inward when allowed to *)
@@ -40,7 +40,7 @@ type ('occ, 'endc, 'tycons, 'zeta, 'delta) reduction =
 | IotaMatch of 'tycons option * 'occ occurrences_gen
 (* Iota-match: match or project on a constructor + inversion in SProp *)
 | Root (* Any reduction applicable at the root of the whole term *)
-| Head (* Any reduction at head *)
+| Head of 'endc end_condition (* Any reduction at head *)
 | Cbv of 'endc end_condition (* Next reduction step of a call-by-value strategy *)
 | Cbn of 'endc end_condition (* Next reduction step of a call-by-name strategy *)
 | Lazy of 'endc end_condition (* Next reduction step of a call-by-need / lazy strategy *)
