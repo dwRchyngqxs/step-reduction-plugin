@@ -5,21 +5,13 @@ DECLARE PLUGIN "rocq-steps.plugin"
   open Stdarg
   open Procq.Prim
   open G_redexpr
-  open Proofview
-  open Notations
   let pr_smart_global = Pputils.pr_or_by_notation Libnames.pr_qualid
   let pr_reduction pr_occ =
     Step.pr_reduction
       (fun o -> Ppred.pr_with_occurrences pr_occ Pp.mt Pp.str (o, ()))
       Pp.mt
-  let bind_occurence occs =
-    Step.map_reduction
-      (fun _ -> if occs = Locus.AllOccurrences then Locus.AtLeastOneOccurrence else occs)
-      (fun x -> x)
-      (fun x -> x)
-      (fun x -> x)
-      (fun x -> x)
   let red_expr = Pvernac.Vernac_.red_expr
+  (* TODO HERE: make the plugin against rocq master, ltac2 (export common plugin code to plugin.ml[i]) *)
 }
 
 ARGUMENT EXTEND nat_or_cond
@@ -51,7 +43,7 @@ ARGUMENT EXTEND step_reduction_ltac
   }
   INTERPRETED BY { fun _ env sigma x ->
     sigma, Step.map_reduction
-      (fun _ -> AtLeastOneOccurrence)
+      (fun _ -> Locus.AtLeastOneOccurrence)
       (fun x -> x)
       (Step.interp_tycons env)
       (Step.interp_zeta env)
@@ -100,33 +92,7 @@ ARGUMENT EXTEND step_reduction_ltac
 END
 
 TACTIC EXTEND step_reduce_ltac
-| [ "steps" step_reduction_ltac(a) clause_dft_concl(cl) ] -> {
-    ( match Redexpr.out_occurrences cl.concl_occs with
-      | NoOccurrences -> tclUNIT ()
-      | occs ->
-        Tactics.reduct_in_concl
-          ~cast:false
-          ~check:false
-          (Step.step (bind_occurence occs (snd a)), Constr.DEFAULTcast)
-    ) <*> Goal.enter (fun gl ->
-      List.fold_left
-        ( fun tcl (occs, hyp) ->
-          tcl <*> Tactics.reduct_in_hyp
-            ~check:false
-            ~reorder:false
-            (Step.step (bind_occurence occs (snd a)))
-            hyp
-        )
-        (tclUNIT ())
-        ( match cl.onhyps with
-          | None ->
-            List.map
-              (fun id -> Locus.AtLeastOneOccurrence, (id, Locus.InHyp))
-              (Tacmach.pf_ids_of_hyps gl)
-          | Some l -> List.map (fun ((occs, id), f) -> Redexpr.out_occurrences occs, (id, f)) l
-        )
-    )
-  }
+| [ "steps" step_reduction_ltac(a) clause_dft_concl(cl) ] -> { Plugin.step_tac (snd a) cl }
 END
 
 GRAMMAR EXTEND Gram
@@ -144,20 +110,26 @@ GLOBAL: red_expr;
       | IDENT "lambda"; id = OPT ident -> { Step.ELambda id }
     ] ]
   ;
-  reduction: (* TODO HERE: "at" occurence *)
-    [ [ IDENT "cast" -> { Step.Cast (AtLeastOneOccurrence : int Locus.occurrences_gen) }
-      | IDENT "beta"; name = OPT ident -> { Step.Beta (name, AtLeastOneOccurrence) }
-      | IDENT "zeta"; name = OPT ident -> { Step.Zeta (name, AtLeastOneOccurrence) }
-      | IDENT "zeta_match"; pc = smart_global; proj = OPT nat_or_var
-        -> { Step.ZetaMatch ((pc, proj), AtLeastOneOccurrence) }
-      | IDENT "delta"; name = OPT smart_global -> { Step.Delta (name, AtLeastOneOccurrence) }
-      | IDENT "eta"; k = eta_kind -> { Step.Eta (k, AtLeastOneOccurrence) }
+  sp_occ:
+    [ [ "at"; occs = occs_nums -> { occs }
+      | "at"; "*" -> { Locus.AllOccurrences }
+      | -> { Locus.AtLeastOneOccurrence }
+    ] ]
+  ;
+  reduction:
+    [ [ IDENT "cast"; o = sp_occ -> { Step.Cast o }
+      | IDENT "beta"; name = OPT ident; o = sp_occ -> { Step.Beta (name, o) }
+      | IDENT "zeta"; name = OPT ident; o = sp_occ -> { Step.Zeta (name, o) }
+      | IDENT "zeta_match"; pc = smart_global; proj = OPT nat_or_var; o = sp_occ
+        -> { Step.ZetaMatch ((pc, proj), o) }
+      | IDENT "delta"; name = OPT smart_global; o = sp_occ -> { Step.Delta (name, o) }
+      | IDENT "eta"; k = eta_kind; o = sp_occ -> { Step.Eta (k, o) }
       | IDENT "evar" -> { Step.Evar }
-      | IDENT "iota_fix"; name = OPT ident -> { Step.IotaFix (name, AtLeastOneOccurrence) }
-      | IDENT "iota_fix'"; name = OPT ident -> { Step.IotaFixPrime (name, AtLeastOneOccurrence) }
-      | IDENT "iota_cofix"; name = OPT ident -> { Step.IotaCofix (name, AtLeastOneOccurrence) }
-      | IDENT "iota_cofix'"; name = OPT ident -> { Step.IotaCofixPrime (name, AtLeastOneOccurrence) }
-      | IDENT "iota_match"; pc = OPT smart_global -> { Step.IotaMatch (pc, AtLeastOneOccurrence) }
+      | IDENT "iota_fix"; name = OPT ident; o = sp_occ -> { Step.IotaFix (name, o) }
+      | IDENT "iota_fix'"; name = OPT ident; o = sp_occ -> { Step.IotaFixPrime (name, o) }
+      | IDENT "iota_cofix"; name = OPT ident; o = sp_occ -> { Step.IotaCofix (name, o) }
+      | IDENT "iota_cofix'"; name = OPT ident; o = sp_occ -> { Step.IotaCofixPrime (name, o) }
+      | IDENT "iota_match"; pc = OPT smart_global; o = sp_occ -> { Step.IotaMatch (pc, o) }
       | IDENT "root" -> { Step.Root }
       | IDENT "head"; c = nat_or_cond -> { Step.Head c }
       | IDENT "cbv"; c = nat_or_cond -> { Step.Cbv c }
@@ -165,6 +137,7 @@ GLOBAL: red_expr;
       | IDENT "lazy"; c = nat_or_cond -> { Step.Lazy c }
     ] ]
   ;
+  (* TODO NEXT: Redexpr.User.create/make *)
   red_expr: TOP
     [ [ IDENT "steps"; reduction -> { CErrors.user_err (Pp.str "User reduction will be added in Rocq 9.2.") }
     ] ]

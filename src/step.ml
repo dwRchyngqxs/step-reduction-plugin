@@ -1369,6 +1369,7 @@ type ('occ, 'endc, 'tycons, 'zeta, 'delta) reduction =
 | Cbv of 'endc end_condition (* Next reduction step of a call-by-value strategy *)
 | Cbn of 'endc end_condition (* Next reduction step of a call-by-name strategy *)
 | Lazy of 'endc end_condition (* Next reduction step of a call-by-need / lazy strategy *)
+type concrete_reduction = (int, unit, inductive * int option, inductive * int * int, Evaluable.t) reduction
 
 let map_end_condition f = function
 | ECNat n -> ECNat n

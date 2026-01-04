@@ -1,4 +1,5 @@
 (coq.theory
  (name Steps)
  (package rocq-steps)
- (plugins rocq-steps.plugin))
+ (plugins rocq-steps.plugin)
+ (theories Ltac2))

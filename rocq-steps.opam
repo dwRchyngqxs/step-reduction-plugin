@@ -1,7 +1,7 @@
 opam-version: "2.0"
 name: "steps"
 version: "0.1"
-maintainer: "Quentin Corradi <quentin.corradi@epfl.ch>"
+maintainer: "Quentin Corradi <q.corradi22@imperial.ac.uk>"
 
 synopsis: "A Rocq plugin to perform single reduction steps"
 description: """
@@ -9,7 +9,6 @@ A Rocq plugin to perform single reduction steps in an easy and controlled manner
 """
 
 authors: [
-  "Quentin Corradi <quentin.corradi@epfl.ch>"
   "Quentin Corradi <q.corradi22@imperial.ac.uk>"
   "Clément Pit-Claudel <clement.pit-claudel@epfl.ch>"
 ]

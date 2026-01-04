@@ -44,6 +44,7 @@ type ('occ, 'endc, 'tycons, 'zeta, 'delta) reduction =
 | Cbv of 'endc end_condition (* Next reduction step of a call-by-value strategy *)
 | Cbn of 'endc end_condition (* Next reduction step of a call-by-name strategy *)
 | Lazy of 'endc end_condition (* Next reduction step of a call-by-need / lazy strategy *)
+type concrete_reduction = (int, unit, inductive * int option, inductive * int * int, Evaluable.t) reduction
 
 val map_end_condition : ('a -> 'b) -> 'a end_condition -> 'b end_condition
 val map_eta_kind : ('a -> 'b) -> 'a eta_kind -> 'b eta_kind
@@ -63,6 +64,4 @@ val pr_reduction :
 val interp_tycons : Environ.env -> GlobRef.t -> inductive * int option
 val interp_zeta :
   Environ.env -> GlobRef.t * int or_var option -> inductive * int * int
-val step :
-  (int, unit, inductive * int option, inductive * int * int, Evaluable.t) reduction ->
-  Reductionops.reduction_function
+val step : concrete_reduction -> Reductionops.reduction_function
